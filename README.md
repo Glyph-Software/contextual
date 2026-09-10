@@ -506,7 +506,6 @@ same defaults. Invalid values fail with the setting name instead of becoming NaN
 | `CONTEXTUAL_BLOB_DIR` | `./blobs` |
 | `CONTEXTUAL_RERANK` | `false`; enables external passage reranking |
 | `CONTEXTUAL_RERANK_MODEL` | `rerank-2.5-lite` |
-<!-- numeric-settings:start -->
 | `CONTEXTUAL_SEARCH_TIMEOUT_MS` | 10000; allowed 1–3600000 |
 | `CONTEXTUAL_GREP_TIMEOUT_MS` | 5000; allowed 1–3600000 |
 | `CONTEXTUAL_MAX_DISTANCE` | 1; allowed 0–2 |
@@ -523,4 +522,3 @@ same defaults. Invalid values fail with the setting name instead of becoming NaN
 | `CONTEXTUAL_OCR_TIMEOUT_MS` | 60000; allowed 1–3600000 |
 | `CONTEXTUAL_OCR_DOCUMENT_TIMEOUT_MS` | 300000; allowed 1–3600000 |
 | `CONTEXTUAL_OCR_MAX_PAGES` | 200; allowed 1–10000 |
-<!-- numeric-settings:end -->
