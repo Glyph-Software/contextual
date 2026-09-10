@@ -41,6 +41,10 @@ without listing millions of them.
 See [USAGE.md](USAGE.md) for the complete setup guide, MCP tool examples,
 configuration, and troubleshooting.
 
+An optional [.env.example](.env.example) shows settings for local embeddings
+and OCR. Copy it to `.env` after installing Ollama, Tesseract, and Poppler;
+the setup steps are in [USAGE.md](USAGE.md).
+
 Requires **Bun 1.4.2 or later** (pinned in `.bun-version`) and Docker.
 
 ```bash
@@ -60,18 +64,34 @@ not expanded and would be passed through verbatim. Then ask a question the corpu
 answers. The agent should reach it on its own via `cx_ls` → `cx_search` →
 `cx_read`, with no `@`-mention.
 
-Semantic search needs an embedding key:
+Semantic search can use a local model through [Ollama](https://ollama.com/download):
 
 ```bash
-export VOYAGE_API_KEY=...              # voyage-4, 1024 dims
+ollama pull qwen3-embedding:0.6b
+export CONTEXTUAL_EMBED_PROVIDER=ollama
+export CONTEXTUAL_EMBED_MODEL=qwen3-embedding:0.6b
 bun run src/cli/contextual.ts reindex
 ```
 
-Without one, **everything still works** — retrieval degrades to full-text only,
+Keep Ollama running and set the same environment on the MCP server. This model
+is a ~639 MB download and produces the 1024-dimensional vectors used by the
+database. No API key is needed. See [local setup](USAGE.md#local-embeddings-with-ollama)
+for startup and configuration.
+
+Alternatively, use Voyage:
+
+```bash
+export VOYAGE_API_KEY=...              # voyage-4, 1024 dims
+export CONTEXTUAL_EMBED_PROVIDER=voyage
+export CONTEXTUAL_EMBED_MODEL=voyage-4
+bun run src/cli/contextual.ts reindex
+```
+
+Without an embedding provider, **everything still works** — retrieval is full-text only,
 and skills need no embeddings at all.
 
 The corpus pins the first embedding model that touches it (`settings.embed_model`).
-Changing `CONTEXTUAL_EMBED_MODEL` afterwards is refused until `reindex --all`
+Changing the embedding provider or `CONTEXTUAL_EMBED_MODEL` afterwards is refused until `reindex --all`
 re-embeds everything, and a query embedded by a different model is skipped rather
 than ranked against vectors from another space. Dimensions are fixed at 1024 by
 the schema, so a model with different dimensions needs a migration, not an env var.
@@ -79,6 +99,67 @@ the schema, so a model with different dimensions needs a migration, not an env v
 Full-text search uses one Postgres text-search configuration, chosen for a
 **new** database with `CONTEXTUAL_FTS_LANGUAGE` (default `english`). It is baked
 into the generated chunk `tsvector` column, so changing it later means a fresh database.
+
+### Streamable HTTP
+
+To serve clients through a URL:
+
+```bash
+bun run src/cli/contextual.ts serve --transport http --port 3000
+```
+
+Connect to `http://127.0.0.1:3000/mcp`. Stdio remains the default. HTTP supports
+current MCP requests and SSE subscriptions, plus stateless 2025-era clients.
+Legacy HTTP clients have no session-based resource subscriptions; GET/DELETE
+session operations return 405. All six tools and resource reads are available.
+
+Set `CONTEXTUAL_HTTP_TOKEN` to require bearer authentication. Non-loopback binds
+require a token; wildcard binds such as `--host 0.0.0.0` also require
+`CONTEXTUAL_HTTP_ALLOWED_HOSTS` (comma-separated hostnames/IPs without ports).
+Host and Origin validation guard the endpoint. For remote use, terminate HTTPS
+at a reverse proxy and preserve SSE streaming. See [USAGE.md](USAGE.md) for
+host configuration and a Deep Agents HTTP example.
+
+### Upload API
+
+The same HTTP service accepts multipart uploads at `POST /api/ingest`:
+
+```bash
+curl --fail-with-body http://127.0.0.1:3000/api/ingest \
+  -F 'files=@./report.pdf' \
+  -F 'collection=handbook'
+```
+
+Repeat `files` for a batch; documents and `.zip`/`.skill` bundles use the existing
+ingest pipeline. Optional fields are `collection`, `force`, and `lenient`.
+The synchronous JSON response contains per-source results and citable URIs:
+200 for success, 207 for mixed results, and 422 when all sources failed or need
+OCR. The HTTP bearer token also authorizes uploads.
+
+Originals are removed after processing; normalized content and assets persist.
+Uploads have a default total limit of 32 MiB and 20 files, controlled by
+`CONTEXTUAL_UPLOAD_MAX_BYTES` and `CONTEXTUAL_UPLOAD_MAX_FILES`. One upload runs
+at a time per listener (other uploads receive 429); MCP reads remain available.
+See [USAGE.md](USAGE.md#upload-files-through-the-http-api) for response fields,
+retry behavior, and curl/Python examples.
+
+### Docker service with local OCR
+
+The service image includes Tesseract 5, English language data, and Poppler.
+It runs as UID/GID 10001, enables local OCR, and exposes HTTP on port 3000.
+The optional Compose `app` profile starts it alongside Postgres:
+
+```bash
+export CONTEXTUAL_HTTP_TOKEN='replace-with-a-long-random-token'
+docker compose --profile app build app
+docker compose --profile app run --rm app migrate
+docker compose --profile app up -d app
+```
+
+Upload to `http://127.0.0.1:3000/api/ingest` with the bearer token. Compose uses
+full-text search by default; configure Ollama for local semantic search. See
+[local OCR and container configuration](USAGE.md#optional-scanned-pdfs-and-ocr)
+for dependencies, languages, processing limits, and pod settings.
 
 ## The namespace
 
@@ -156,7 +237,11 @@ hash on `sources` making re-ingest idempotent.
   ~100 tokens of overlap. Oversize paragraphs and lists split at sentence/item
   boundaries, with a hard bound for a single very long item. Large tables split
   into row batches with repeated headers; fenced code remains atomic.
-- **Embedding** sends Voyage `truncation: true` and batches by count *and*
+- **Embedding** supports Voyage or a local Ollama endpoint. Ollama defaults to
+  `qwen3-embedding:0.6b`, uses small sequential batches, adds the Qwen query
+  instruction, and validates 1024-dimensional outputs. Provider/model identities
+  are pinned separately to prevent incompatible vectors being mixed.
+  Voyage sends `truncation: true` and batches by count *and*
   estimated tokens. A batch the API rejects is retried one chunk at a time, so
   one oversize code block leaves only itself without a vector instead of its whole
   source. The HNSW index is partial (`WHERE embedding IS NOT NULL`) and is
@@ -165,7 +250,7 @@ hash on `sources` making re-ingest idempotent.
   `add` invocation. Source writes finish before one aggregate embedding pass.
   A smaller `add` pays the incremental cost rather than dropping an index other
   queries are using. The rebuild is in a `finally`, so a failed load cannot
-  leave the corpus unindexed. Requests have timeouts, bounded retries with
+  leave the corpus unindexed. Both providers have request timeouts. Voyage has bounded retries with
   jitter, and support both forms of `Retry-After`. Authentication and input
   failures are classified separately. A failed embedding run leaves full-text
   retrieval available for a later `reindex`.
@@ -180,12 +265,15 @@ stream for PDFs so the chunker never has to care which it is looking at.
 **HTML is not an anydoc format.** It keeps a `@mozilla/readability` + `turndown`
 path, routed from `detect.ts`.
 
-**Scanned PDFs fail loudly.** anydoc reads a PDF's text layer only. A scanned
-document lands as `status='needs_ocr'`, is surfaced in `contextual list` and in
-`ctx://index`, and ingests nothing — rather than silently storing an empty
-document. Opting into `CONTEXTUAL_OCR=hosted` sends the file to Firecrawl Parse;
-that is a privacy decision, so it is never on by default and **the file leaves
-your machine**.
+**Scanned PDFs support local OCR.** `CONTEXTUAL_OCR=local` uses Poppler to render
+scanned pages and Tesseract to recognize text on the service's machine. Mixed
+PDFs retain their digital text and native Markdown headings in page order.
+The Docker image enables this mode. Outside Docker, the default is `reject`:
+scans land as `status='needs_ocr'` and remain visible in the catalog. Missing
+OCR dependencies, timeouts, and unreadable scanned pages fail explicitly without
+ingesting partial content. `CONTEXTUAL_OCR=hosted` is a separate opt-in that
+sends the file to Firecrawl Parse; **the file leaves your machine**. Local mode
+never falls back to hosted OCR.
 
 ## Retrieval
 
@@ -252,10 +340,12 @@ malicious skill is an agent hijack. Therefore:
 - **`allowed-tools` is advisory.** It is stored and shown by `cx_skill` with a
   note that enforcement is the client's job; this server cannot stop a skill
   from asking for Bash.
-- **Single-tenant v1 has no auth, by design.** Do not expose this to a network.
-  It binds to a local stdio transport and assumes one trusted user, and
-  `docker-compose.yml` publishes Postgres on `127.0.0.1` only — the default
-  credentials are not a secret.
+- **The corpus is single-tenant.** Stdio assumes a trusted local host. HTTP
+  defaults to loopback, validates Host/Origin, and supports a shared bearer
+  token (required outside loopback). Remote deployments need HTTPS through a
+  reverse proxy; OAuth and per-user isolation are not implemented.
+  `docker-compose.yml` publishes Postgres on `127.0.0.1` only; its default
+  credentials are for local development.
 
 ## Layout
 
@@ -265,23 +355,24 @@ src/
   core/                     # transport-agnostic — survives the move to hosted
     db.ts                   # Bun.sql + pgvector + settings + migrations
     tokens.ts               # BUDGET + estimateTokens (re-exported by mcp/format)
-    ingest/  detect skill document chunk embed pipeline
+    ingest/  detect skill document local-ocr chunk embed pipeline
     vfs/     uri resolve list glob grep
     search/  hybrid rrf
     catalog/ index watch
-  mcp/       server resources tools format
+  mcp/       server http http-body uploads resources tools format
   cli/       contextual.ts
 test/                       # bun test
 ```
 
-Keeping `core/` free of MCP types is what makes a later HTTP/multi-tenant server
-additive rather than a rewrite; `test/layering.test.ts` fails if anything under
+Stdio and HTTP share the transport-independent `core/`;
+`test/layering.test.ts` fails if anything under
 `src/core/` imports from `src/mcp/`.
 
 ## Runtime notes
 
-Bun is the runtime and package manager. There is no build step — `bun run
-src/mcp/server.ts` *is* the server; `tsconfig.json` exists for editor types and
+Bun is the runtime and package manager. Development runs directly from source
+with `bun run serve`; `bun run build` produces the standalone executable used
+by the Docker image. `tsconfig.json` provides editor types and supports
 `bun run typecheck`.
 
 **stdout is the JSON-RPC channel.** A single stray `console.log` corrupts the
@@ -320,7 +411,7 @@ contextual list                 Show what is ingested, with the index token cost
 contextual reindex [--all]      Embed chunks that have no vector yet
 contextual remove <kind> <name> Remove a source
 contextual migrate              Apply database migrations
-contextual serve                Run the MCP stdio server
+contextual serve                Run MCP over stdio (default) or Streamable HTTP
 ```
 
 | Flag | Meaning |
@@ -331,6 +422,9 @@ contextual serve                Run the MCP stdio server
 | `--all` | `reindex`: re-embed everything and re-pin the model |
 | `--allow-reserved` | Permit `claude`/`anthropic` in a skill name |
 | `--json` | Machine-readable output |
+| `--transport <stdio\|http>` | `serve`: select transport (default stdio) |
+| `--host <address>` | HTTP bind address (default `127.0.0.1`) |
+| `--port <number>` | HTTP port (default `3000`) |
 
 ### On `--allow-reserved`
 
@@ -351,13 +445,16 @@ bun run test:binary # compile and test migrations, native DOCX ingest, and MCP
 ```
 
 The integration and server suites create a throwaway Postgres schema, ingest real
-files, and drive the server over an actual pipe — the only way to catch the two
-classes of bug that unit tests cannot see: SQL binding behaviour, and stdout
-contamination.
+files, and drive the server over real stdio pipes and HTTP sockets. They check
+SQL bindings, stdout purity, both protocol eras, HTTP authentication, and SSE
+notifications across concurrent requests.
 
 Database suites skip cleanly with a start-Postgres message when unavailable;
 CI sets `CONTEXTUAL_REQUIRE_DB_TESTS=1` to make unavailable Postgres a failure.
 Each suite restores its database environment and preserves existing URL options.
+Local OCR tests exercise real scanned and mixed PDFs when Tesseract and Poppler
+are installed; CI installs them and sets `CONTEXTUAL_REQUIRE_OCR_TESTS=1`.
+`bun run scripts/make-ocr-fixture.ts` regenerates the image-only text fixture.
 
 ## Upgrading an existing corpus
 
@@ -398,10 +495,13 @@ same defaults. Invalid values fail with the setting name instead of becoming NaN
 |---|---|
 | `CONTEXTUAL_DATABASE_URL` | Local Docker Postgres on port 55432 |
 | `VOYAGE_API_KEY` | Optional Voyage authentication |
+| `CONTEXTUAL_EMBED_PROVIDER` | `voyage` (default), `ollama`, or `none`; Voyage without a key uses full-text only |
+| `CONTEXTUAL_OLLAMA_URL` | `http://127.0.0.1:11434`; Ollama base URL |
 | `CONTEXTUAL_VOYAGE_API_KEY` | Alias for `VOYAGE_API_KEY` |
-| `CONTEXTUAL_EMBED_MODEL` | `voyage-4`, 1024 dimensions |
+| `CONTEXTUAL_EMBED_MODEL` | `voyage-4` for Voyage; `qwen3-embedding:0.6b` for Ollama; 1024 dimensions |
 | `CONTEXTUAL_FTS_LANGUAGE` | `english`; pinned on a new database |
-| `CONTEXTUAL_OCR` | `reject`; `hosted` opts into external OCR |
+| `CONTEXTUAL_OCR` | `reject` outside Docker; image defaults to `local` (Tesseract + Poppler); `hosted` opts into Firecrawl |
+| `CONTEXTUAL_OCR_LANGUAGE` | `eng`; installed Tesseract languages, e.g. `eng+deu` |
 | `FIRECRAWL_API_KEY` | Hosted OCR authentication |
 | `CONTEXTUAL_BLOB_DIR` | `./blobs` |
 | `CONTEXTUAL_RERANK` | `false`; enables external passage reranking |
@@ -417,4 +517,10 @@ same defaults. Invalid values fail with the setting name instead of becoming NaN
 | `CONTEXTUAL_VOYAGE_TIMEOUT_MS` | 30000; allowed 1–3600000 |
 | `CONTEXTUAL_VOYAGE_MAX_ATTEMPTS` | 6; allowed 1–10 |
 | `CONTEXTUAL_VOYAGE_RETRY_MAX_MS` | 120000; allowed 1–3600000 |
+| `CONTEXTUAL_UPLOAD_MAX_BYTES` | 33554432; allowed 1024–268435456 |
+| `CONTEXTUAL_UPLOAD_MAX_FILES` | 20; allowed 1–200 |
+| `CONTEXTUAL_OLLAMA_TIMEOUT_MS` | 30000; allowed 1–3600000 |
+| `CONTEXTUAL_OCR_TIMEOUT_MS` | 60000; allowed 1–3600000 |
+| `CONTEXTUAL_OCR_DOCUMENT_TIMEOUT_MS` | 300000; allowed 1–3600000 |
+| `CONTEXTUAL_OCR_MAX_PAGES` | 200; allowed 1–10000 |
 <!-- numeric-settings:end -->

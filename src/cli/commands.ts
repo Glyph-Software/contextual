@@ -9,9 +9,8 @@
  *   contextual migrate
  *   contextual serve
  *
- * Everything here writes to stdout freely — this is a terminal, not the MCP
- * transport. `serve` is the exception: it execs the stdio server, where stdout
- * belongs to JSON-RPC.
+ * Everything here writes to stdout freely except `serve`, which delegates to
+ * the transport. Stdio reserves stdout for JSON-RPC; HTTP logs go to stderr.
  */
 import { configHelp, databaseHint } from '../core/config';
 import { parseArgs } from 'node:util';
@@ -30,7 +29,7 @@ Usage:
   contextual reindex              Embed any chunks that have no vector yet
   contextual remove <kind> <name> Remove a source (kind: skill | doc)
   contextual migrate              Apply database migrations
-  contextual serve                Run the MCP stdio server
+  contextual serve                Run the MCP server (stdio by default)
 
 Options:
   --collection <name>   Collection for ingested documents (default: "default")
@@ -38,23 +37,32 @@ Options:
   --force               Re-ingest even when the content hash is unchanged
   --allow-reserved      Permit "claude"/"anthropic" in a skill name (see README)
   --all                 reindex: re-embed every chunk, not only unembedded ones
-                        (also required after changing CONTEXTUAL_EMBED_MODEL)
+                        (also required after changing embedding provider/model)
   --json                Machine-readable output
+  --transport <name>    serve: stdio (default) or http (Streamable HTTP at /mcp)
+  --host <address>      HTTP bind address (default: 127.0.0.1)
+  --port <number>       HTTP port (default: 3000)
   -h, --help
 
 Environment:
   CONTEXTUAL_DATABASE_URL   Postgres URL (default: local docker-compose)
-  VOYAGE_API_KEY            Enables semantic search; without it, full-text only
-  CONTEXTUAL_EMBED_MODEL    Voyage model id (default: voyage-4). The corpus pins the
-                            first model used; switching needs \`reindex --all\`
+  CONTEXTUAL_EMBED_PROVIDER voyage (default), ollama (local), or none (full-text only)
+  VOYAGE_API_KEY            Enables Voyage embeddings; not needed for Ollama
+  CONTEXTUAL_EMBED_MODEL    Default: voyage-4 or qwen3-embedding:0.6b for Ollama
+                           The corpus pins the first model; switching needs \`reindex --all\`
+  CONTEXTUAL_OLLAMA_URL     Ollama base URL (default: http://127.0.0.1:11434)
   CONTEXTUAL_FTS_LANGUAGE   Text-search configuration for a *new* database
                             (default: english; cannot change after migrate)
-  CONTEXTUAL_OCR=hosted     Send scanned PDFs to Firecrawl Parse (leaves this machine)
+  CONTEXTUAL_OCR            reject (default), local (Tesseract), or hosted (Firecrawl)
+                           Hosted OCR sends the PDF off this machine
+  CONTEXTUAL_OCR_LANGUAGE   Tesseract languages (default: eng; e.g. eng+deu)
   CONTEXTUAL_BLOB_DIR       Where binary assets are written (default: ./blobs)
   CONTEXTUAL_VOYAGE_API_KEY Alias for VOYAGE_API_KEY
   FIRECRAWL_API_KEY         Hosted OCR key
   CONTEXTUAL_RERANK         Enable Voyage reranking (true/false, default false)
   CONTEXTUAL_RERANK_MODEL   Default: rerank-2.5-lite
+  CONTEXTUAL_HTTP_TOKEN     HTTP bearer token; required for non-loopback binds
+  CONTEXTUAL_HTTP_ALLOWED_HOSTS  Comma-separated HTTP Host/Origin hostnames
 ${configHelp()}
 `;
 
@@ -71,6 +79,9 @@ function safeParseArgs() {
     'allow-reserved': { type: 'boolean', default: false },
     all: { type: 'boolean', default: false },
     json: { type: 'boolean', default: false },
+    transport: { type: 'string' },
+    host: { type: 'string' },
+    port: { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   },
 }); } catch (err) {
@@ -87,6 +98,9 @@ if (flags.help || !command) {
 }
 
 try {
+  if (command !== 'serve' && (flags.transport !== undefined || flags.host !== undefined || flags.port !== undefined)) {
+    throw new Error('--transport, --host, and --port are only valid with serve');
+  }
   switch (command) {
     case 'add': await cmdAdd(rest); break;
     case 'list': await cmdList(); break;
@@ -128,8 +142,8 @@ async function cmdAdd(paths: string[]): Promise<void> {
     if (r.detail) console.log(`    ${r.detail.split('\n')[0]}`);
   }
   if (!getEmbedder() && results.some((r) => r.chunks > 0)) {
-    console.log('\nNote: VOYAGE_API_KEY is not set, so nothing was embedded and search is full-text only.\n' +
-                'Set it and run `contextual reindex` to enable semantic search.');
+    console.log('\nNote: no embedding provider is enabled, so search is full-text only.\n' +
+                'Set CONTEXTUAL_EMBED_PROVIDER=ollama or configure VOYAGE_API_KEY, then run `contextual reindex`.');
   }
 }
 
@@ -166,7 +180,7 @@ async function cmdList(): Promise<void> {
 
 async function cmdReindex(): Promise<void> {
   const embedder = getEmbedder();
-  if (!embedder) throw new Error('reindex: set VOYAGE_API_KEY first (nothing else can produce vectors)');
+  if (!embedder) throw new Error('reindex: set CONTEXTUAL_EMBED_PROVIDER=ollama or configure VOYAGE_API_KEY to produce vectors');
 
   await migrate();
   const { total, embedded } = await embedMissing(embedder, {
@@ -194,7 +208,16 @@ async function cmdMigrate(): Promise<void> {
 }
 
 async function cmdServe(): Promise<void> {
+  const transport = flags.transport ?? 'stdio';
+  if (transport !== 'stdio' && transport !== 'http') throw new Error('--transport must be stdio or http');
+  if (transport === 'stdio' && (flags.host !== undefined || flags.port !== undefined)) {
+    throw new Error('--host and --port require --transport http');
+  }
+  const port = flags.port === undefined ? undefined : Number(flags.port);
+  if (port !== undefined && (!/^\d+$/.test(flags.port!) || !Number.isInteger(port) || port < 1 || port > 65535)) {
+    throw new Error('--port must be an integer between 1 and 65535');
+  }
   await closeDb();
   const { serve } = await import('../mcp/server');
-  await serve();
+  await serve({ transport, host: flags.host, port });
 }

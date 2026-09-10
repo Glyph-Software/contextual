@@ -1,6 +1,25 @@
 # Single-tenant local Postgres for contextual. Full-text (tsvector) and vectors
 # (pgvector) live in one database so hybrid retrieval is one SQL statement.
 services:
+  app:
+    profiles: [app]
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      CONTEXTUAL_DATABASE_URL: postgres://contextual:contextual@db:5432/contextual
+      CONTEXTUAL_OCR: local
+      CONTEXTUAL_OCR_LANGUAGE: ${CONTEXTUAL_OCR_LANGUAGE:-eng}
+      CONTEXTUAL_EMBED_PROVIDER: ${CONTEXTUAL_EMBED_PROVIDER:-none}
+      CONTEXTUAL_OLLAMA_URL: ${CONTEXTUAL_OLLAMA_URL:-http://host.docker.internal:11434}
+      CONTEXTUAL_HTTP_TOKEN: ${CONTEXTUAL_HTTP_TOKEN:-}
+      CONTEXTUAL_HTTP_ALLOWED_HOSTS: ${CONTEXTUAL_HTTP_ALLOWED_HOSTS:-localhost,127.0.0.1}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - contextual-blobs:/app/blobs
   db:
     image: pgvector/pgvector:0.8.6-pg17
     shm_size: 1gb
@@ -10,9 +29,8 @@ services:
       POSTGRES_USER: contextual
       POSTGRES_PASSWORD: contextual
       POSTGRES_DB: contextual
-    # Loopback only. The MCP server has no auth by design (single tenant,
-    # stdio), and the credentials below are defaults: publishing the port on
-    # 0.0.0.0 would hand the whole corpus to anyone on the LAN.
+    # Keep Postgres on loopback: these are development credentials.
+    # The HTTP service has its own bearer authentication.
     ports:
       - "127.0.0.1:55432:5432"
     volumes:
@@ -25,3 +43,4 @@ services:
 
 volumes:
   contextual-pgdata:
+  contextual-blobs:

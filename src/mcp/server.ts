@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * contextual — MCP stdio server.
+ * contextual — MCP server over stdio or Streamable HTTP.
  *
  * Two surfaces over one URI namespace:
  *   Tools     (cx_*)  — model-driven. This is how the VFS actually gets used.
@@ -14,12 +14,15 @@ import { registerResources, stopResourceWatch } from './resources';
 import { registerTools } from './tools';
 import { log } from './format';
 import { closeDb } from '../core/db';
+import { validateConfig } from '../core/config';
 
-export function createServer(era: 'legacy' | 'modern' = 'legacy'): McpServer {
+export function createServer(era: 'legacy' | 'modern' = 'legacy', watchResources = true): McpServer {
   const server = new McpServer(
     { name: 'contextual', version: '0.1.0' },
     {
-      capabilities: { resources: { subscribe: true, listChanged: true }, tools: {}, completions: {} },
+      // Legacy HTTP is stateless: it has no session for subscriptions. Modern
+      // HTTP subscriptions are served by the SDK handler's shared event bus.
+      capabilities: { resources: { subscribe: watchResources || era === 'modern', listChanged: watchResources || era === 'modern' }, tools: {}, completions: {} },
       instructions:
         'contextual publishes uploaded documents and Agent Skills as one browsable virtual filesystem.\n' +
         'Start with cx_ls("/") — a cheap catalog of everything available. Then cx_search(queries) to\n' +
@@ -29,13 +32,19 @@ export function createServer(era: 'legacy' | 'modern' = 'legacy'): McpServer {
     },
   );
 
-  registerResources(server, era);
+  registerResources(server, era, watchResources);
   registerTools(server);
   return server;
 }
 
-export async function serve(): Promise<never> {
-  const handle = serveStdio(({ era }) => createServer(era), { onerror: (err) => log('transport:', err.message) });
+export interface ServeOptions { transport?: 'stdio' | 'http'; host?: string; port?: number }
+
+export async function serve(options: ServeOptions = {}): Promise<never> {
+  validateConfig();
+  const http = options.transport === 'http';
+  const handle = http
+    ? (await import('./http')).startHttpServer({ host: options.host, port: options.port })
+    : serveStdio(({ era }) => createServer(era), { onerror: (err) => log('transport:', err.message) });
 
   // The SDK crashes on an abrupt client disconnect: the write to a closed pipe
   // raises an unhandled EPIPE. Exiting quietly is the correct response — the
@@ -60,11 +69,11 @@ export async function serve(): Promise<never> {
     }
     process.exit(0);
   };
-  process.stdin.once('end', shutdown);
+  if (!http) process.stdin.once('end', shutdown);
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  log('serving on stdio');
+  log(http ? `serving Streamable HTTP at ${'url' in handle ? handle.url : ''}` : 'serving on stdio');
   return await new Promise<never>(() => {});
 }
 

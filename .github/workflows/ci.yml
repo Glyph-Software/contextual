@@ -17,12 +17,14 @@ jobs:
           --health-interval 2s --health-timeout 3s --health-retries 30
     env:
       CONTEXTUAL_REQUIRE_DB_TESTS: '1'
+      CONTEXTUAL_REQUIRE_OCR_TESTS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.2'
       - run: bun install --frozen-lockfile
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng poppler-utils zip unzip
       - run: bun run typecheck
       - run: bun run lint
       - run: bun run scripts/config-docs.ts --check

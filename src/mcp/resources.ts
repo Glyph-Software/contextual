@@ -41,11 +41,15 @@ export const MAX_RESOURCE_BLOB_BYTES = envNumber('CONTEXTUAL_MAX_RESOURCE_BLOB_B
 /** Page size for `resources/list`. Overridable so a test can exercise paging. */
 const PAGE = envNumber('CONTEXTUAL_RESOURCE_PAGE');
 
-export function registerResources(server: McpServer, era: 'legacy' | 'modern' = 'legacy'): void {
-  stopResourceWatch();
-  subscriptions.clear();
-  modernClient = era === 'modern';
-  active = server;
+export function registerResources(server: McpServer, era: 'legacy' | 'modern' = 'legacy', watch = true): void {
+  // HTTP constructs a server per request and publishes changes through its
+  // shared handler. Only a long-lived stdio connection owns this registry.
+  if (watch) {
+    stopResourceWatch();
+    subscriptions.clear();
+    modernClient = era === 'modern';
+    active = server;
+  }
 
   server.registerResource(
     'catalog',
@@ -107,6 +111,8 @@ export function registerResources(server: McpServer, era: 'legacy' | 'modern' = 
     const nextCursor = rows.length > PAGE ? encodeCursor(offset + PAGE) : undefined;
     return { resources: page, ...(nextCursor && { nextCursor }) };
   });
+
+  if (!watch) return;
 
   // The SDK does not implement resources/subscribe, so the subscription
   // registry lives here. Without it, declaring `subscribe: true` would

@@ -2,5 +2,8 @@ node_modules/
 blobs/
 *.log
 .env
+.env.*
+!.env.example
+.DS_Store
 dist/
 *.tgz

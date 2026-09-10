@@ -7,7 +7,7 @@
     "contextual": "bin/contextual"
   },
   "scripts": {
-    "serve": "bun run src/mcp/server.ts",
+    "serve": "bun run src/cli/contextual.ts serve",
     "ingest": "bun run src/cli/contextual.ts add",
     "migrate": "bun run src/cli/contextual.ts migrate",
     "test": "bun test",

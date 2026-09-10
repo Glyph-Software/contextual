@@ -21,6 +21,8 @@ import { toDocument, toMarkdownBytes, formatFromBytes, formatFromPath } from '@f
 import type { Document as AnyDoc, Block, Inline, Table, Cell } from '@firecrawl/anydoc';
 import { decodeText } from './text';
 import { blocksFromMarkdown, type SourceBlock } from './chunk';
+import { ocrMode } from '../config';
+import { localPdfMarkdown } from './local-ocr';
 
 export interface NormalizedAsset {
   id: number;
@@ -44,7 +46,7 @@ export class NeedsOcrError extends Error {
     super(
       `PDF needs OCR: ${pages.length} of ${pageCount} page(s) are scanned or image-only ` +
         `(${pages.slice(0, 10).join(', ')}${pages.length > 10 ? '…' : ''}). ` +
-        `anydoc reads a PDF's text layer only. Set CONTEXTUAL_OCR=hosted to send this document to ` +
+        `Set CONTEXTUAL_OCR=local to use Tesseract and Poppler on this machine, or CONTEXTUAL_OCR=hosted to send this document to ` +
         `Firecrawl Parse instead — note that the file then leaves this machine.`,
     );
   }
@@ -57,16 +59,21 @@ export class UnsupportedFormatError extends Error {
 export async function normalize(bytes: Uint8Array, filename: string): Promise<Normalized> {
   const format = formatFromBytes(bytes) ?? formatFromPath(filename) ?? undefined;
 
-  // OCR is opt-in and off by default: a local-first single-tenant service must
-  // not silently ship a user's documents off the machine.
-  const ocr = process.env.CONTEXTUAL_OCR === 'hosted' ? ('hosted' as const) : ('reject' as const);
+  const mode = ocrMode();
+  // Native text extraction always runs first. Local mode never enables hosted OCR.
+  const ocr = mode === 'hosted' ? ('hosted' as const) : ('reject' as const);
 
   if (format === 'pdf') {
     try {
       const md = await toMarkdownBytes(bytes, format, { ocr, apiKey: process.env.FIRECRAWL_API_KEY });
       return { blocks: blocksFromMarkdown(md), markdown: md, assets: [], format, via: 'markdown' };
     } catch (err) {
-      throw translate(err);
+      const error = translate(err);
+      if (mode === 'local' && error instanceof NeedsOcrError) {
+        const md = await localPdfMarkdown(bytes, error.pages, error.pageCount);
+        return { blocks: blocksFromMarkdown(md), markdown: md, assets: [], format, via: 'markdown' };
+      }
+      throw error;
     }
   }
 

@@ -31,6 +31,8 @@ export interface IngestOptions {
   /** Permit the spec's reserved words in a skill name. See skill.ts. */
   allowReserved?: boolean;
   lenient?: boolean;
+  /** Inputs staged by an upload API have no persistent filesystem origin. */
+  uploaded?: boolean;
   onProgress?: (msg: string) => void;
 }
 
@@ -210,6 +212,7 @@ async function ingestSkill(root: string, origin: string, opts: IngestOptions, lo
   const parsed = parseSkillMd(raw, { allowReservedNames: opts.allowReserved, lenient: opts.lenient, onWarning: log });
   const { name } = parsed.frontmatter;
   assertSafeName(name, 'skill name');
+  if (opts.uploaded) origin = `upload://skills/${encodeURIComponent(name)}`;
 
   // The hash covers every file in the bundle, so touching a reference file
   // re-ingests the skill even though SKILL.md is unchanged.
@@ -223,13 +226,14 @@ async function ingestSkill(root: string, origin: string, opts: IngestOptions, lo
   const sql = db();
   const existing = (await sql`SELECT id, content_hash FROM sources WHERE kind='skill' AND name=${name}`) as unknown as { id: number; content_hash: string }[];
   if (existing[0] && existing[0].content_hash === contentHash && !opts.force) {
+    if (opts.uploaded) await sql`UPDATE sources SET origin_uri = ${origin} WHERE id = ${existing[0].id} AND origin_uri IS DISTINCT FROM ${origin}`;
     return { status: 'unchanged', kind: 'skill', name, sourceId: existing[0].id, nodes: 0, chunks: 0, embedded: 0, uris: [] };
   }
 
   // The same bundle re-ingested under a new frontmatter name is a rename, not
   // a second skill: identity is (kind, name), so without this the old name
   // would stay in the catalog forever.
-  const renamed = (await sql`
+  const renamed = opts.uploaded ? [] : (await sql`
     SELECT id, name FROM sources WHERE kind='skill' AND origin_uri=${origin} AND name<>${name}`) as unknown as { id: number; name: string }[];
 
   const blobDir = join(opts.blobDir ?? defaultBlobDir(), crypto.randomUUID());
@@ -318,6 +322,9 @@ async function ingestDocument(detection: Detection, opts: IngestOptions, log: (m
   const filename = basename(detection.path);
   const collection = opts.collection ?? 'default';
   assertSafeName(collection, 'collection');
+  const origin = opts.uploaded
+    ? `upload://docs/${encodeURIComponent(collection)}/${encodeURIComponent(filename)}`
+    : detection.path;
 
   const bytes = await Bun.file(detection.path).bytes();
   const contentHash = new Bun.CryptoHasher('sha256').update(bytes).digest('hex');
@@ -327,6 +334,7 @@ async function ingestDocument(detection: Detection, opts: IngestOptions, log: (m
     SELECT id, content_hash, status FROM sources
     WHERE kind='doc' AND name=${filename} AND coalesce(collection,'') = ${collection}`) as unknown as { id: number; content_hash: string; status: string }[];
   if (existing[0] && existing[0].content_hash === contentHash && existing[0].status === 'ready' && !opts.force) {
+    if (opts.uploaded) await sql`UPDATE sources SET origin_uri = ${origin} WHERE id = ${existing[0].id} AND origin_uri IS DISTINCT FROM ${origin}`;
     return { status: 'unchanged', kind: 'doc', name: filename, collection, sourceId: existing[0].id, nodes: 0, chunks: 0, embedded: 0, uris: [] };
   }
 
@@ -334,12 +342,13 @@ async function ingestDocument(detection: Detection, opts: IngestOptions, log: (m
   // a name whose original path no longer exists. Reclaim it rather than
   // storing the same document twice.
   const renamed: { id: number; name: string }[] = [];
-  if (!existing[0]) {
+  if (!existing[0] && !opts.uploaded) {
     const twins = (await sql`
       SELECT id, name, origin_uri AS "originUri" FROM sources
       WHERE kind='doc' AND coalesce(collection,'') = ${collection} AND content_hash = ${contentHash} AND name <> ${filename}`) as unknown as
       { id: number; name: string; originUri: string | null }[];
     for (const twin of twins) {
+      if (twin.originUri?.startsWith('upload://')) continue;
       if (twin.originUri && (await exists(twin.originUri))) continue;
       renamed.push(twin);
     }
@@ -363,7 +372,7 @@ async function ingestDocument(detection: Detection, opts: IngestOptions, log: (m
     const oldBlobs = existing[0] ? await blobRefsOf(existing[0].id) : [];
     const rows = (await sql`
       INSERT INTO sources (kind, name, collection, origin_uri, content_hash, status, detail)
-      VALUES ('doc', ${filename}, ${collection}, ${detection.path}, ${contentHash}, ${status}, ${detail})
+      VALUES ('doc', ${filename}, ${collection}, ${origin}, ${contentHash}, ${status}, ${detail})
       ON CONFLICT (kind, coalesce(collection, ''), name)
       DO UPDATE SET content_hash = EXCLUDED.content_hash, status = EXCLUDED.status,
                     detail = EXCLUDED.detail, updated_at = now()
@@ -392,7 +401,7 @@ async function ingestDocument(detection: Detection, opts: IngestOptions, log: (m
     for (const old of renamed) await tx`DELETE FROM sources WHERE id = ${old.id}`;
     const rows = (await tx`
       INSERT INTO sources (kind, name, collection, origin_uri, content_hash, status, detail)
-      VALUES ('doc', ${filename}, ${collection}, ${detection.path}, ${contentHash}, 'ready', NULL)
+      VALUES ('doc', ${filename}, ${collection}, ${origin}, ${contentHash}, 'ready', NULL)
       ON CONFLICT (kind, coalesce(collection, ''), name)
       DO UPDATE SET content_hash = EXCLUDED.content_hash, origin_uri = EXCLUDED.origin_uri,
                     status = 'ready', detail = NULL, updated_at = now()

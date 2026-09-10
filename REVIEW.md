@@ -1,5 +1,8 @@
 # contextual — second-pass architecture review
 
+> Historical review. Findings describe the implementation at review time;
+> see [README.md](README.md) and [USAGE.md](USAGE.md) for current behavior.
+
 Reviewed 3 Sep 2026 against the repo *after* the first review’s 21 findings were implemented. This is not a test-failure report: the suite is doing its job. It is the leftovers and the holes the fixes introduced.
 
 **12 findings:** 4 high · 7 medium · 1 low.

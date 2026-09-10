@@ -10,7 +10,34 @@ export const NUMERIC_SETTINGS = {
   CONTEXTUAL_VOYAGE_TIMEOUT_MS: [30000, 1, 3600000, true],
   CONTEXTUAL_VOYAGE_MAX_ATTEMPTS: [6, 1, 10, true],
   CONTEXTUAL_VOYAGE_RETRY_MAX_MS: [120000, 1, 3600000, true],
+  CONTEXTUAL_UPLOAD_MAX_BYTES: [33554432, 1024, 268435456, true],
+  CONTEXTUAL_UPLOAD_MAX_FILES: [20, 1, 200, true],
+  CONTEXTUAL_OLLAMA_TIMEOUT_MS: [30000, 1, 3600000, true],
+  CONTEXTUAL_OCR_TIMEOUT_MS: [60000, 1, 3600000, true],
+  CONTEXTUAL_OCR_DOCUMENT_TIMEOUT_MS: [300000, 1, 3600000, true],
+  CONTEXTUAL_OCR_MAX_PAGES: [200, 1, 10000, true],
 } as const;
+export function ocrMode(): 'reject' | 'local' | 'hosted' {
+  const mode = process.env.CONTEXTUAL_OCR ?? 'reject';
+  if (mode !== 'reject' && mode !== 'local' && mode !== 'hosted') {
+    throw new Error('CONTEXTUAL_OCR must be reject, local, or hosted');
+  }
+  return mode;
+}
+export function ocrLanguage(): string {
+  const language = process.env.CONTEXTUAL_OCR_LANGUAGE ?? 'eng';
+  if (!/^[a-zA-Z0-9_]+(?:\+[a-zA-Z0-9_]+)*$/.test(language)) {
+    throw new Error('CONTEXTUAL_OCR_LANGUAGE must contain Tesseract language names, such as eng or eng+deu');
+  }
+  return language;
+}
+export function embedProvider(): 'voyage' | 'ollama' | 'none' {
+  const provider = process.env.CONTEXTUAL_EMBED_PROVIDER ?? 'voyage';
+  if (provider !== 'voyage' && provider !== 'ollama' && provider !== 'none') {
+    throw new Error('CONTEXTUAL_EMBED_PROVIDER must be voyage, ollama, or none');
+  }
+  return provider;
+}
 export function envNumber(name: keyof typeof NUMERIC_SETTINGS): number {
   const [fallback, min, max, integer] = NUMERIC_SETTINGS[name];
   const raw = process.env[name];
@@ -23,7 +50,9 @@ export function envNumber(name: keyof typeof NUMERIC_SETTINGS): number {
 }
 export function validateConfig(): void {
   for (const key of Object.keys(NUMERIC_SETTINGS)) envNumber(key as keyof typeof NUMERIC_SETTINGS);
-  if (process.env.CONTEXTUAL_OCR && !['hosted', 'reject'].includes(process.env.CONTEXTUAL_OCR)) throw new Error('CONTEXTUAL_OCR must be hosted or reject');
+  embedProvider();
+  ocrMode();
+  ocrLanguage();
   if (process.env.CONTEXTUAL_RERANK && !['true', 'false'].includes(process.env.CONTEXTUAL_RERANK)) throw new Error('CONTEXTUAL_RERANK must be true or false');
 }
 export function configHelp(): string {

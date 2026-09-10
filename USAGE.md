@@ -61,7 +61,8 @@ bun run src/cli/contextual.ts list
 ```
 
 You should see `quickstart.md` in collection `demo` with status `ready` and at
-least one chunk. An `EMBED` count of zero is expected without a Voyage API key.
+least one chunk. An `EMBED` count of zero is expected until an embedding provider
+(local Ollama or Voyage with an API key) is enabled.
 The document is readable at `ctx://docs/demo/quickstart.md`.
 
 ## 3. Connect an MCP client
@@ -104,6 +105,231 @@ Try asking your agent:
 The expected answer from the sample is **every weekday at 09:00 UTC**. The
 agent can discover the collection with `cx_ls`, find the passage with
 `cx_search`, and follow its citation with `cx_read`.
+
+## 4. Connect over Streamable HTTP
+
+To connect through a URL, start contextual as a long-running HTTP service:
+
+```bash
+# From the contextual checkout, with the same database and blob settings as add
+bun run src/cli/contextual.ts serve --transport http
+
+# Choose a different port
+bun run src/cli/contextual.ts serve --transport http --port 8080
+```
+
+The default endpoint is **`http://127.0.0.1:3000/mcp`**. Stdio remains the
+default when `--transport` is omitted. The standalone executable accepts the
+same options, for example `./dist/contextual serve --transport http`.
+The package script also accepts them: `bun run serve --transport http`.
+
+For an MCP host that accepts URL-based `mcpServers` entries:
+
+```json
+{
+  "mcpServers": {
+    "contextual": {
+      "url": "http://127.0.0.1:3000/mcp"
+    }
+  }
+}
+```
+
+Start and manage the HTTP service separately; URL-based clients connect to it
+without spawning Bun. The service process needs the database URL, blob directory,
+and any embedding-provider settings. A client connecting from another machine only needs
+the endpoint URL and, when configured, its bearer token.
+
+### Authentication and network access
+
+HTTP binds to loopback by default. To require a bearer token even on loopback:
+
+```bash
+export CONTEXTUAL_HTTP_TOKEN='replace-with-a-long-random-secret'
+bun run src/cli/contextual.ts serve --transport http
+```
+
+Clients then send `Authorization: Bearer <token>` on each request. Store the
+token in your host's secret configuration. This is a shared token for the
+whole corpus; contextual does not implement OAuth login or per-user isolation.
+
+For a service reached through your network or a reverse proxy:
+
+```bash
+export CONTEXTUAL_HTTP_TOKEN='replace-with-a-long-random-secret'
+export CONTEXTUAL_HTTP_ALLOWED_HOSTS='contextual.example.com'
+bun run src/cli/contextual.ts serve --transport http --host 0.0.0.0 --port 3000
+```
+
+Replace the example hostname with the hostname or IP clients actually use.
+Non-loopback binds require a token, and wildcard binds also require an explicit
+host allowlist. `CONTEXTUAL_HTTP_ALLOWED_HOSTS` accepts comma-separated hostnames
+or IPs without schemes or ports; bracket IPv6 addresses. Incoming `Host` and
+present `Origin` headers are checked against this list. When unset on loopback,
+the allowlist contains localhost addresses. Cross-origin browser CORS support
+is not configured; these examples use native MCP clients.
+
+Use HTTPS at a reverse proxy for remote connections: contextual's listener
+speaks plain HTTP. Preserve an allowed `Host`, forward authorization, and disable
+response buffering for SSE. The HTTP server and CLI still share one database
+and blob store. Stop the service with Ctrl-C or SIGTERM.
+
+### Protocol behavior
+
+HTTP exposes the same six tools and readable resources as stdio. The SDK's
+`createMcpHandler` provides current MCP request handling, SSE subscriptions,
+and stateless compatibility for 2025-era clients. See the
+[SDK HTTP guide](https://github.com/modelcontextprotocol/typescript-sdk/blob/main/docs/serving/http.md).
+
+Current clients can receive corpus updates through `subscriptions/listen`.
+Legacy HTTP clients can initialize, list, search, and read, but do not receive
+session-based resource subscriptions: no `Mcp-Session-Id` is issued, and GET
+and DELETE session operations return 405. Legacy stdio subscriptions continue
+to work. MCP POST requests are limited to 1 MiB; uploads have a separate limit.
+
+## Upload files through the HTTP API
+
+The HTTP service exposes **`POST /api/ingest`**. Send files as
+`multipart/form-data`; the response arrives after normalization, indexing, and
+any configured embedding work. This is a synchronous API, with no job ID to
+poll. Uploaded content becomes available through MCP reads and resource
+notifications.
+
+Start the service from the contextual checkout:
+
+```bash
+bun run serve --transport http
+```
+
+In another terminal, upload a document:
+
+```bash
+curl --fail-with-body http://127.0.0.1:3000/api/ingest \
+  -F 'file=@./report.pdf' \
+  -F 'collection=handbook'
+```
+
+For a batch, repeat `files` for documents or skill archives:
+
+```bash
+curl --fail-with-body http://127.0.0.1:3000/api/ingest \
+  -F 'files=@./notes.md' \
+  -F 'files=@./report.pdf' \
+  -F 'files=@./support-guide.skill' \
+  -F 'collection=handbook' \
+  -F 'force=false'
+```
+
+For a token-protected service, include its bearer token:
+
+```bash
+curl --fail-with-body http://127.0.0.1:3000/api/ingest \
+  -H "Authorization: Bearer $CONTEXTUAL_HTTP_TOKEN" \
+  -F 'files=@./report.pdf' \
+  -F 'collection=handbook'
+```
+
+The same HTTP token authorizes MCP reads and uploads, including replacements of
+existing sources. Host and Origin checks apply to uploads too. Let your HTTP
+library generate the multipart Content-Type and boundary.
+
+| Multipart field | Required | Meaning |
+|---|---|---|
+| `files` or `file` | At least one | File bytes; repeat either field for multiple files |
+| `collection` | No | Document collection, default `default`; skills use their frontmatter names |
+| `force` | No | `true` reconverts unchanged files; default `false` |
+| `lenient` | No | `true` permits unknown skill frontmatter fields with warnings; default `false` |
+
+Use unique filenames within a request. Filenames and collections must be single
+names without path separators or control characters, up to 255 UTF-8 bytes.
+Boolean fields accept exactly `true` or `false`; duplicate option fields and
+unknown fields return 400 before ingestion starts. Upload a bundle with
+reference files or assets as `.zip` or `.skill`.
+
+### Responses and retries
+
+Completed ingestion attempts return these JSON fields:
+
+| Field | Meaning |
+|---|---|
+| `status` | `completed`, `partial`, or `failed` |
+| `summary` | Counts for `files`, `ingested`, `unchanged`, `needs_ocr`, and `failed` |
+| `results` | Per-source records with `input` filename, `kind`, `name`, `status`, optional `collection`/`sourceId`/`detail`, `nodes`, `chunks`, `embedded`, and `uris` |
+| `messages` | Up to 50 bounded progress/diagnostic messages, including embedding failures or lenient validation warnings |
+
+A skill archive can produce multiple source records, so source counts may
+exceed the number of uploaded files. Follow returned `ctx://` URIs with
+`cx_read`. Unchanged sources return their existing IDs with zero new
+nodes/chunks/embeddings and empty `uris` arrays.
+
+| HTTP status | Meaning |
+|---|---|
+| `200` | Every source was ingested or unchanged |
+| `207` | Some sources succeeded; others failed or need OCR. Inspect every result. |
+| `422` | No source succeeded; results explain failures or OCR requirements |
+| `400` / `415` | Invalid fields/multipart body, or unsupported request Content-Type |
+| `401` / `403` | Missing/incorrect bearer token, or rejected Host/Origin |
+| `413` | Request size or file count exceeded its limit |
+| `408` | The upload body did not arrive within 120 seconds |
+| `429` | Another upload is running on this listener; retry after it finishes (`Retry-After: 1`) |
+| `503` / `500` | Database/migration availability or an unexpected server error; check server logs |
+
+Successful files stay indexed when another file fails. After ingestion starts,
+the service finishes the batch even if the client disconnects. Re-uploading the
+same filename and bytes to the same collection is idempotent. Different upload
+filenames remain separate sources, even when their bytes match. Changed bytes
+replace the matching collection/filename; a failed conversion preserves any
+previously ready version.
+
+The server's embedding-provider and OCR settings apply. Full-text ingestion can succeed
+while embeddings are missing: check `embedded` against `chunks` and read
+`messages`. For `needs_ocr`, set `CONTEXTUAL_OCR=local` on a server with Tesseract
+and Poppler installed, then re-upload with `force=true`. OCR mode is a server
+setting, not a multipart field.
+
+Original uploads are staged in a private temporary directory and deleted when
+processing finishes. Normalized text stays in Postgres; extracted/bundled assets
+stay in `CONTEXTUAL_BLOB_DIR`. Re-upload with `force=true` to reconvert an original
+after parser changes.
+
+Defaults are **32 MiB for the entire multipart body**, including overhead, and
+**20 files per request**. Set `CONTEXTUAL_UPLOAD_MAX_BYTES` and
+`CONTEXTUAL_UPLOAD_MAX_FILES` in the server environment to change these. One
+upload runs at a time per listener; MCP reads remain available. Configure any
+reverse proxy's size limits and timeouts to accommodate ingestion and embedding.
+
+### Python upload example
+
+Install `requests` in your Python environment (`python -m pip install requests`),
+then run this from a directory containing `report.pdf`:
+
+```python
+import os
+from pathlib import Path
+
+import requests
+
+base_url = os.environ.get("CONTEXTUAL_HTTP_URL", "http://127.0.0.1:3000")
+token = os.environ.get("CONTEXTUAL_HTTP_TOKEN")
+path = Path("report.pdf")
+
+with path.open("rb") as stream:
+    response = requests.post(
+        f"{base_url.rstrip('/')}/api/ingest",
+        headers={"Authorization": f"Bearer {token}"} if token else {},
+        files=[("files", (path.name, stream, "application/pdf"))],
+        data={"collection": "handbook", "force": "false"},
+        timeout=(10, 300),
+    )
+
+if response.status_code not in {200, 207, 422}:
+    response.raise_for_status()
+for result in response.json()["results"]:
+    print(result["input"], result["status"], result["uris"], result.get("detail", ""))
+```
+
+`CONTEXTUAL_HTTP_URL` is the base URL for this upload example. MCP clients
+connect to `/mcp` on the same service.
 
 ## Example: connect to LangChain Deep Agents (Python)
 
@@ -228,7 +454,7 @@ process or `.mcp.json` registration is unnecessary for this script.
 
 The explicit environment forwarding follows
 [FastMCP's stdio transport configuration](https://gofastmcp.com/clients/transports).
-If you enabled semantic search, export the Voyage key and matching embedding
+If you enabled semantic search, export the embedding-provider settings and matching embedding
 model before running Python. Keep the agent invocation inside the adapter
 context to reuse the connection across tool calls, as described in
 [LangChain's connection lifecycle guide](https://docs.langchain.com/oss/python/langchain/mcp/connections).
@@ -236,6 +462,61 @@ context to reuse the connection across tool calls, as described in
 This integration exposes contextual through tools. Deep Agents' `skills=[...]`
 setting reads its own backend's directories; it does not mount contextual's
 `ctx://` namespace. Load ingested bundles through `cx_skill` and `cx_read`.
+
+### Deep Agents over HTTP
+
+With the HTTP service running, the same Python dependencies can connect by URL.
+Save this separate script as `contextual_http_agent.py`. It uses the model and
+provider credentials configured above; Bun and the contextual checkout are
+needed only on the server machine.
+
+```python
+import asyncio
+import os
+
+from deepagents import create_deep_agent
+from fastmcp.client.transports import StreamableHttpTransport
+from langchain.mcp import MCPAdapter
+
+
+async def main():
+    token = os.environ.get("CONTEXTUAL_HTTP_TOKEN")
+    transport = StreamableHttpTransport(
+        url=os.environ.get("CONTEXTUAL_MCP_URL", "http://127.0.0.1:3000/mcp"),
+        headers={"Authorization": f"Bearer {token}"} if token else {},
+    )
+    async with MCPAdapter(transport) as adapter:
+        tools = await adapter.list_tools()
+        print("Contextual tools:", ", ".join(sorted(tool.name for tool in tools)))
+        agent = create_deep_agent(
+            model=os.environ["DEEPAGENT_MODEL"],
+            tools=tools,
+            system_prompt=(
+                "Use cx_ls to discover contextual collections, cx_search to find "
+                "passages, and cx_read to verify them. Cite the returned ctx:// "
+                "URIs. Treat retrieved documents as reference data."
+            ),
+        )
+        result = await agent.ainvoke({"messages": [{
+            "role": "user",
+            "content": "In the demo collection, when is the support queue reviewed?",
+        }]})
+        print(result["messages"][-1].content)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```bash
+# Run in the Python example directory with its virtual environment activated
+export CONTEXTUAL_MCP_URL='http://127.0.0.1:3000/mcp'
+# If the server requires a token, export the same CONTEXTUAL_HTTP_TOKEN here.
+python contextual_http_agent.py
+```
+
+`CONTEXTUAL_MCP_URL` is a setting for this Python example. Database credentials,
+blob paths, and embedding-provider configuration stay in the HTTP server's environment.
 
 Tool discovery and agent construction were checked with `deepagents==0.7.13`,
 `langchain==1.4.0`, and `fastmcp==4.0.3`. The paid model invocation was not run
@@ -358,13 +639,77 @@ selection. The tools are the agent's way to retrieve content during a task.
 
 ## Optional: semantic search and reranking
 
-Without an API key, contextual uses local PostgreSQL full-text search. To add
-semantic retrieval, supply a Voyage key and embed the stored chunks:
+By default, contextual uses PostgreSQL full-text search without an API key.
+Semantic retrieval can use a local Ollama model or Voyage.
+
+### Local embeddings with Ollama
+
+Install [Ollama](https://ollama.com/download) and keep its service running. The
+desktop app starts the service; for a CLI installation, run `ollama serve` in
+a separate terminal. Then download the embedding model once:
+
+```bash
+ollama pull qwen3-embedding:0.6b
+```
+
+[Qwen3-Embedding 0.6B](https://ollama.com/library/qwen3-embedding:0.6b) is about
+639 MB to download. It produces 1024-dimensional embeddings, matching
+Contextual's database schema. Runtime memory also depends on input length and
+batch size. Use the explicit `:0.6b` tag: the untagged model downloads a larger
+variant.
+
+Enable it, embed your existing documents, and start the MCP server:
+
+```bash
+export CONTEXTUAL_EMBED_PROVIDER=ollama
+export CONTEXTUAL_EMBED_MODEL=qwen3-embedding:0.6b
+export CONTEXTUAL_OLLAMA_URL=http://127.0.0.1:11434
+export CONTEXTUAL_RERANK=false
+bun run src/cli/contextual.ts reindex
+bun run serve --transport http
+```
+
+No Voyage API key is needed. With the loopback URL above, document and query
+embeddings are computed on this machine. New uploads and `add` operations
+embed automatically. A remote Ollama URL sends those texts to that server.
+The CLI and MCP process must use the same provider, model, and database.
+For stdio, put those variables in the MCP host's `env` configuration.
+
+If the corpus already contains embeddings from another provider or model, run
+`bun run src/cli/contextual.ts reindex --all` once to replace them. Since a
+corpus ingested without a provider has no vectors, regular `reindex` is enough
+for that first setup. Files do not need to be uploaded again. Restart the MCP
+server after changing provider settings.
+
+Ollama requests use batches of at most eight inputs and a 30-second timeout
+per batch (`CONTEXTUAL_OLLAMA_TIMEOUT_MS`). If loading the model on your machine
+takes longer, warm it up before connecting clients or adjust that timeout.
+A failed query embedding falls back to full-text search; failed ingestion
+embeddings can be retried with `reindex`. Contextual does not automatically
+switch to Voyage when Ollama is unavailable.
+
+Other Ollama embedding models must return 1024-dimensional vectors. The Qwen
+family gets a retrieval instruction on queries; documents are embedded without
+that instruction. Other model names receive the text unchanged, so check their
+prompt requirements before substituting one. Model aliases must identify the
+same weights across the CLI and server; after updating weights behind a tag,
+rebuild vectors with `reindex --all`.
+
+This adds local embeddings. The optional reranker is still Voyage-based and
+disabled by default; keep `CONTEXTUAL_RERANK=false` for local-only retrieval.
+
+### Voyage embeddings
+
+To use Voyage instead, supply a key and embed the stored chunks:
 
 ```bash
 export VOYAGE_API_KEY='your-voyage-api-key'
+export CONTEXTUAL_EMBED_PROVIDER=voyage
+export CONTEXTUAL_EMBED_MODEL=voyage-4
 bun run src/cli/contextual.ts reindex
 ```
+
+Use `reindex --all` when switching an existing corpus from Ollama to Voyage.
 
 Also provide `VOYAGE_API_KEY` in the MCP server's environment so it can embed
 search queries. New `add` operations embed automatically when a key is present.
@@ -396,8 +741,87 @@ to Voyage. If reranking fails, retrieval falls back to its original ranking.
 
 ## Optional: scanned PDFs and OCR
 
-A PDF without usable text is recorded as `needs_ocr` and is not searchable.
-You can OCR it locally and ingest the resulting text-based PDF or Markdown.
+Use Tesseract and Poppler for CPU-only OCR inside the service, without sending
+the document to an OCR API. Install the executables once:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng poppler-utils
+
+# macOS development
+brew install tesseract poppler
+```
+
+Enable local OCR on CLI invocations and on the HTTP server:
+
+```bash
+export CONTEXTUAL_OCR=local
+bun run src/cli/contextual.ts add ./scanned.pdf --collection handbook --force
+```
+
+Existing PDF text is extracted first. Only pages identified as scanned need
+Tesseract; mixed PDFs preserve native text and Markdown headings on digital
+pages. Scanned pages produce plain text, so OCR does not reconstruct table
+cells or heading levels. The original PDF is not rewritten.
+
+The service runs one local OCR document at a time and one Tesseract thread.
+Each page is rendered in grayscale with its longest side scaled to 3500 pixels
+(roughly 300 DPI for A4), and temporary files are removed after success or failure. Defaults
+are 60 seconds per subprocess, 5 minutes per document after queue admission,
+and 200 total pages per PDF requiring OCR. These are controlled by
+`CONTEXTUAL_OCR_TIMEOUT_MS`, `CONTEXTUAL_OCR_DOCUMENT_TIMEOUT_MS`, and
+`CONTEXTUAL_OCR_MAX_PAGES`. Native addon calls cannot be interrupted mid-call;
+the document deadline is checked between processing steps. Configure proxy
+request timeouts to accommodate synchronous OCR uploads.
+
+`CONTEXTUAL_OCR_LANGUAGE` defaults to `eng`. For German, install
+`tesseract-ocr-deu` and set `CONTEXTUAL_OCR_LANGUAGE=eng+deu`. The Debian image
+uses the distribution's fast language data. Additional language data must be
+installed in the image; nothing is downloaded while handling a document.
+
+### Docker and Kubernetes
+
+The root `Dockerfile` compiles the service and bundles Tesseract and Poppler
+in a Debian runtime image. Local OCR is enabled by default:
+
+```bash
+docker build -t contextual:local .
+```
+
+For a local service and database, use the optional Compose profile:
+
+```bash
+export CONTEXTUAL_HTTP_TOKEN='replace-with-a-long-random-token'
+docker compose --profile app build app
+docker compose --profile app run --rm app migrate
+docker compose --profile app up -d app
+curl --fail-with-body http://127.0.0.1:3000/api/ingest \
+  -H "Authorization: Bearer $CONTEXTUAL_HTTP_TOKEN" \
+  -F 'files=@./scanned.pdf' -F 'collection=handbook' -F 'force=true'
+```
+
+The `app` profile uses full-text search by default. To use Ollama, set
+`CONTEXTUAL_EMBED_PROVIDER=ollama` and `CONTEXTUAL_OLLAMA_URL` to an address
+reachable from the container before starting it. `host.docker.internal` is a
+Docker Desktop convenience; Linux or Kubernetes deployments should provide
+their Ollama service address.
+
+For a pod, configure `CONTEXTUAL_DATABASE_URL`, `CONTEXTUAL_HTTP_TOKEN` from a
+Secret, and `CONTEXTUAL_HTTP_ALLOWED_HOSTS` with the hostnames clients use
+(without ports). The image listens on `0.0.0.0:3000` and runs as UID/GID 10001.
+Run `contextual migrate` as a deployment job before serving a new database.
+Persist `/app/blobs` on a writable volume; provide writable `/tmp` if the root
+filesystem is read-only. Set CPU/memory requests and limits based on your PDFs;
+page-size and concurrency limits do not constitute a fixed RAM guarantee.
+
+### Disabled or hosted OCR
+
+Outside the image, the default `CONTEXTUAL_OCR=reject` records PDFs requiring
+OCR as `needs_ocr`; they are not searchable. Local OCR failures (missing tools
+or languages, timeouts, or scanned pages with no recognized text) are reported
+as `failed` and do not ingest partial documents. Correct the cause and retry
+with `--force` or upload field `force=true`.
 
 Alternatively, explicitly enable hosted OCR:
 
@@ -477,12 +901,23 @@ original documents. Restart the MCP server to load updated code.
 | `CONTEXTUAL_DATABASE_URL` | Local Compose database URL shown above | Database shared by the CLI and MCP server |
 | `CONTEXTUAL_BLOB_DIR` | `./blobs` relative to process working directory | Stored binary assets; use an absolute path |
 | `VOYAGE_API_KEY` | Unset | Enable embeddings and semantic queries; `CONTEXTUAL_VOYAGE_API_KEY` is an alias |
-| `CONTEXTUAL_EMBED_MODEL` | `voyage-4` | Embedding model; switching requires `reindex --all` |
+| `CONTEXTUAL_EMBED_PROVIDER` | `voyage` | `voyage`, `ollama`, or `none`; Voyage without a key uses full-text only |
+| `CONTEXTUAL_EMBED_MODEL` | `voyage-4` / `qwen3-embedding:0.6b` | Provider-dependent default; changing provider/model requires `reindex --all` |
+| `CONTEXTUAL_OLLAMA_URL` | `http://127.0.0.1:11434` | Base URL of the Ollama service |
+| `CONTEXTUAL_OLLAMA_TIMEOUT_MS` | `30000` | Timeout per Ollama embedding request |
 | `CONTEXTUAL_FTS_LANGUAGE` | `english` | PostgreSQL text-search configuration; choose before the first migration of a new database |
-| `CONTEXTUAL_OCR` | `reject` | Set to `hosted` to enable external OCR |
+| `CONTEXTUAL_OCR` | `reject`; `local` in the Docker image | `local` uses Tesseract + Poppler; `hosted` enables external OCR |
+| `CONTEXTUAL_OCR_LANGUAGE` | `eng` | Installed Tesseract languages, e.g. `eng+deu` |
+| `CONTEXTUAL_OCR_TIMEOUT_MS` | `60000` | Timeout per local OCR subprocess |
+| `CONTEXTUAL_OCR_DOCUMENT_TIMEOUT_MS` | `300000` | Local OCR document deadline after queue admission |
+| `CONTEXTUAL_OCR_MAX_PAGES` | `200` | Total PDF page limit when local OCR is required |
 | `FIRECRAWL_API_KEY` | Unset | Hosted OCR credentials |
 | `CONTEXTUAL_RERANK` | `false` | Optional Voyage reranking |
 | `CONTEXTUAL_RERANK_MODEL` | `rerank-2.5-lite` | Reranking model |
+| `CONTEXTUAL_HTTP_TOKEN` | Unset | HTTP bearer token; required outside loopback |
+| `CONTEXTUAL_HTTP_ALLOWED_HOSTS` | Localhost addresses on loopback; otherwise bind hostname | Comma-separated Host/Origin hostnames; required for wildcard binds |
+| `CONTEXTUAL_UPLOAD_MAX_BYTES` | `33554432` | Maximum total multipart upload size, including overhead |
+| `CONTEXTUAL_UPLOAD_MAX_FILES` | `20` | Maximum uploaded files per request |
 | `CONTEXTUAL_SEARCH_TIMEOUT_MS` | `10000` | Database search timeout |
 | `CONTEXTUAL_GREP_TIMEOUT_MS` | `5000` | Database regex-search timeout |
 | `CONTEXTUAL_MAX_DISTANCE` | `1` | Maximum cosine distance for vector candidates; range 0–2 |
@@ -526,12 +961,18 @@ Rebuild after updating the source.
 | Cannot connect to Postgres | Start Docker, run `docker compose up -d`, check `docker compose ps`, and verify the database URL and port 55432. |
 | Missing tables or schema errors | Run `bun run migrate` against the same database used by the failing process. |
 | MCP host cannot start contextual | Check its Bun executable, absolute server path, Bun version, and server logs. Ensure the database is running. |
+| HTTP connection refused | Start `serve --transport http` separately and check the URL, `/mcp` path, bind address, and port. |
+| HTTP returns 401 or 403 | For 401, send the configured bearer token. For 403, check Host/Origin against `CONTEXTUAL_HTTP_ALLOWED_HOSTS`, including any reverse proxy's forwarded Host. |
+| HTTP GET returns 405 | This is expected for legacy session operations. Connect with a Streamable HTTP MCP client; a browser GET is not a tool call. |
 | CLI lists data but the agent sees an empty catalog | Compare the CLI and MCP host's database URLs; reconnect the host after config changes. |
 | Assets cannot be read | Verify the recorded blob files still exist and the server can access their directory. Preserve blobs when moving or restoring the database. |
 | Search finds no passages | Use `cx_ls` to confirm the collection, check source status, broaden wording, and verify the scope uses virtual paths. Without a key, try words actually present in the text. |
-| Source is `ready`, but `EMBED` is zero or below `CHUNKS` | Full-text ingestion succeeded; configure the Voyage key, inspect API errors, and run `reindex`. The MCP process also needs the key for semantic queries. |
+| Source is `ready`, but `EMBED` is zero or below `CHUNKS` | Full-text ingestion succeeded; configure Ollama or Voyage, inspect embedding errors, and run `reindex`. The MCP process needs the same provider configuration. |
+| Ollama model or endpoint not found | Start Ollama, run `ollama pull qwen3-embedding:0.6b`, and check `CONTEXTUAL_OLLAMA_URL`. |
+| Ollama returns incompatible vectors | Use a model that produces 1024 dimensions; models with 384 or 768 dimensions need a schema change and are not drop-in replacements. |
 | Embedding model mismatch | Use the pinned model, or deliberately switch with `reindex --all` and update the host's model setting too. |
-| PDF shows `needs_ocr` | OCR locally, or opt into hosted OCR and re-add with `--force`. |
+| PDF shows `needs_ocr` | Set `CONTEXTUAL_OCR=local`, install Tesseract + Poppler, and re-add with `--force`. |
+| Local OCR fails | Check the named executable/language, scan quality, and OCR limits; retry with `--force` after correcting the cause. |
 | Skill frontmatter rejected | Check required fields and name rules. Use `--lenient` only for unsupported extra fields. |
 | Grep times out or rejects a regex | Narrow `path_glob`, simplify the PostgreSQL regex, and adjust the timeout only if needed. |
 | `serve` appears to hang in a terminal | It is a stdio MCP server waiting for protocol messages. Let your MCP host launch it. |

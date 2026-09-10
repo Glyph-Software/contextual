@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!package.json
+!bun.lock
+!src/
+!src/**
+!db/
+!db/**
