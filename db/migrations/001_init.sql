@@ -4,7 +4,9 @@
 -- `{{FTS_CONFIG}}` is substituted by migrate() with the text-search
 -- configuration chosen for this database (default: english).
 
-CREATE EXTENSION IF NOT EXISTS vector;
+-- Extensions are database-wide; keep their objects visible to every corpus
+-- schema instead of installing them into the first caller's search_path.
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 
 CREATE TABLE IF NOT EXISTS sources (
   id           bigserial PRIMARY KEY,

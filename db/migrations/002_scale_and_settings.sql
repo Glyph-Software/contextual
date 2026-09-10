@@ -14,7 +14,7 @@ INSERT INTO settings (key, value) VALUES ('fts_config', '{{FTS_CONFIG}}')
 
 -- cx_grep matches with ~ / ~* in Postgres. A trigram GIN index makes that an
 -- index scan instead of a sequential read of every stored file.
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
 CREATE INDEX IF NOT EXISTS nodes_content_trgm_idx
   ON nodes USING gin (content gin_trgm_ops);
 

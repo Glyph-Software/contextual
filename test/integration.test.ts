@@ -808,6 +808,16 @@ describe('CLI and migration regressions', () => {
     const schema = `${SCHEMA}_upgrade`;
     const connection = new SQL(schemaUrl(schema));
     try {
+      // A fresh database must not put extension objects in the first test
+      // schema: the independently migrated legacy corpus needs them too.
+      const extensions = await connection`
+        SELECT e.extname AS name, n.nspname AS schema
+        FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+        WHERE e.extname IN ('vector', 'pg_trgm') ORDER BY e.extname`;
+      expect(extensions.map((extension: { name: string; schema: string }) => ({ ...extension }))).toEqual([
+        { name: 'pg_trgm', schema: 'public' },
+        { name: 'vector', schema: 'public' },
+      ]);
       await connection.unsafe(`CREATE SCHEMA ${schema}`);
       await connection.unsafe('CREATE TABLE _migrations(name text PRIMARY KEY, applied_at timestamptz DEFAULT now())');
       for (const migration of ['001_init.sql', '002_scale_and_settings.sql']) {
@@ -820,7 +830,7 @@ describe('CLI and migration regressions', () => {
         await connection`INSERT INTO nodes(source_id,path,uri,role,content) VALUES (${source.id}, ${path}, ${`ctx://docs/encoded/${path}`}, 'doc', 'legacy text')`;
       }
       const result = await cliRun(['migrate'], undefined, cli, schemaUrl(schema));
-      expect(result.code).toBe(0);
+      expect(result.code, result.stderr).toBe(0);
       const rows = await connection`SELECT uri FROM nodes ORDER BY uri` as unknown as { uri: string }[];
       expect(rows.map((r) => r.uri)).toContain('ctx://docs/encoded/a%20b.md');
       expect(rows.map((r) => r.uri)).toContain('ctx://docs/encoded/a%2520b.md');
