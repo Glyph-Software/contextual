@@ -1,0 +1,27 @@
+# Single-tenant local Postgres for contextual. Full-text (tsvector) and vectors
+# (pgvector) live in one database so hybrid retrieval is one SQL statement.
+services:
+  db:
+    image: pgvector/pgvector:0.8.6-pg17
+    shm_size: 1gb
+    restart: unless-stopped
+    container_name: contextual-db
+    environment:
+      POSTGRES_USER: contextual
+      POSTGRES_PASSWORD: contextual
+      POSTGRES_DB: contextual
+    # Loopback only. The MCP server has no auth by design (single tenant,
+    # stdio), and the credentials below are defaults: publishing the port on
+    # 0.0.0.0 would hand the whole corpus to anyone on the LAN.
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - contextual-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U contextual -d contextual"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  contextual-pgdata:

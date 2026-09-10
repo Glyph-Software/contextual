@@ -1,0 +1,32 @@
+name: checks
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.6-pg17
+        env:
+          POSTGRES_USER: contextual
+          POSTGRES_PASSWORD: contextual
+          POSTGRES_DB: contextual
+        ports: ['55432:5432']
+        options: >-
+          --shm-size=1g
+          --health-cmd "pg_isready -U contextual -d contextual"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      CONTEXTUAL_REQUIRE_DB_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run lint
+      - run: bun run scripts/config-docs.ts --check
+      - run: bun test
+      - run: bun run eval
+      - run: bun run build
+      - run: bun run scripts/smoke-build.ts

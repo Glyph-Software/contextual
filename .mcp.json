@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "contextual": {
+      "command": "bun",
+      "args": ["run", "/absolute/path/to/contextual/src/mcp/server.ts"],
+      "env": {
+        "CONTEXTUAL_DATABASE_URL": "postgres://contextual:contextual@localhost:55432/contextual"
+      }
+    }
+  }
+}

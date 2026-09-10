@@ -1,0 +1,49 @@
+{
+  "name": "contextual",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A context service for agents: RAG corpora + Agent Skills as one lazily-browsed virtual filesystem over MCP.",
+  "bin": {
+    "contextual": "bin/contextual"
+  },
+  "scripts": {
+    "serve": "bun run src/mcp/server.ts",
+    "ingest": "bun run src/cli/contextual.ts add",
+    "migrate": "bun run src/cli/contextual.ts migrate",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/cli/contextual.ts --compile --outfile dist/contextual",
+    "eval": "bun run scripts/eval.ts",
+    "lint": "biome check src test scripts",
+    "test:binary": "bun run build && bun run scripts/smoke-build.ts"
+  },
+  "dependencies": {
+    "@firecrawl/anydoc": "^0.2.4",
+    "@joplin/turndown-plugin-gfm": "^1.0.68",
+    "@mozilla/readability": "^0.6.0",
+    "linkedom": "^0.18.13",
+    "pgvector": "^0.3.0",
+    "turndown": "^7.2.4",
+    "zod": "^4.5.4",
+    "@modelcontextprotocol/server": "2.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.13",
+    "@types/bun": "^1.4.0",
+    "@types/turndown": "^5.0.6",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "bun": ">=1.4.2"
+  },
+  "packageManager": "bun@1.4.2",
+  "license": "MIT",
+  "files": [
+    "bin",
+    "src",
+    "db/migrations",
+    "README.md",
+    "USAGE.md",
+    "LICENSE"
+  ]
+}

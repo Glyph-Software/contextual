@@ -1,0 +1,3 @@
+[test]
+# Ingest and search tests hit a real Postgres; the default 5s is too tight.
+timeout = 30000

@@ -1,0 +1,122 @@
+{
+  "documents": [
+    {
+      "name": "press.md",
+      "content": "# Widget Press\n\n## Safety\n\nVent the chamber before maintenance.\n\n## Temperature\n\nSeal widgets at 412 kelvin."
+    },
+    {
+      "name": "pump.md",
+      "content": "# Coolant Pump\n\n## Safety\n\nDisconnect electrical power before maintenance.\n\n## Pressure\n\nKeep coolant pressure below 18 bar."
+    },
+    {
+      "name": "tolerances.md",
+      "content": "# Machining Tolerances\n\n## Radial\n\nRadial tolerance is 0.04 millimetres.\n\n## Axial\n\nAxial tolerance is 0.11 millimetres."
+    },
+    {
+      "name": "storage.md",
+      "content": "# Storage\n\nArchive completed reports for seven years. Encrypt archived reports at rest."
+    },
+    {
+      "name": "release.md",
+      "content": "# Release Procedure\n\nRun typechecking and integration tests before publishing a release. Tag the exact tested commit."
+    },
+    {
+      "name": "travel.md",
+      "content": "# Travel Expenses\n\nSubmit travel receipts within thirty days. Managers approve reimbursement requests."
+    },
+    {
+      "name": "inventory.md",
+      "content": "# Inventory\n\nCount spare bearings every Friday. Reorder when fewer than twelve remain."
+    },
+    {
+      "name": "batteries.md",
+      "content": "# Battery Care\n\nStore batteries at half charge. Avoid direct sunlight and temperatures above 40 Celsius."
+    }
+  ],
+  "questions": [
+    {
+      "queries": [
+        "What temperature seals widgets?"
+      ],
+      "expected": [
+        "press.md"
+      ]
+    },
+    {
+      "queries": [
+        "What is the maximum coolant pressure?"
+      ],
+      "expected": [
+        "pump.md"
+      ]
+    },
+    {
+      "queries": [
+        "What is the radial tolerance?"
+      ],
+      "expected": [
+        "tolerances.md"
+      ]
+    },
+    {
+      "queries": [
+        "How long should completed reports be archived?"
+      ],
+      "expected": [
+        "storage.md"
+      ]
+    },
+    {
+      "queries": [
+        "Which checks precede publishing a release?"
+      ],
+      "expected": [
+        "release.md"
+      ]
+    },
+    {
+      "queries": [
+        "When must travel receipts be submitted?"
+      ],
+      "expected": [
+        "travel.md"
+      ]
+    },
+    {
+      "queries": [
+        "When should spare bearings be reordered?"
+      ],
+      "expected": [
+        "inventory.md"
+      ]
+    },
+    {
+      "queries": [
+        "How should batteries be stored?"
+      ],
+      "expected": [
+        "batteries.md"
+      ]
+    },
+    {
+      "queries": [
+        "How should I prepare the chamber for maintenance?",
+        "How do I disconnect the coolant pump?"
+      ],
+      "expected": [
+        "press.md",
+        "pump.md"
+      ]
+    },
+    {
+      "queries": [
+        "How long retain reports?",
+        "Who approves travel reimbursement?"
+      ],
+      "expected": [
+        "storage.md",
+        "travel.md"
+      ]
+    }
+  ]
+}
