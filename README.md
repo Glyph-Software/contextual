@@ -5,6 +5,11 @@ bundles, digests them, and republishes them as a single addressable virtual
 filesystem that an agent browses lazily — reading only what it needs, when it
 needs it.
 
+Run it over stdio or authenticated Streamable HTTP. The HTTP service accepts
+file uploads; the Docker image includes local Tesseract OCR, and Ollama can
+provide local embeddings. Full-text search works without an embedding model
+or API key.
+
 The design goal is **progressive disclosure**: a cheap always-available catalog
 at level 0, targeted reads at level 1, deep bundle files at level 2. Nothing
 enters an agent's context unless the agent asked for it.
@@ -45,7 +50,10 @@ An optional [.env.example](.env.example) shows settings for local embeddings
 and OCR. Copy it to `.env` after installing Ollama, Tesseract, and Poppler;
 the setup steps are in [USAGE.md](USAGE.md).
 
-Requires **Bun 1.4.2 or later** (pinned in `.bun-version`) and Docker.
+Running from source requires **Bun 1.4.2 or later** (pinned in `.bun-version`)
+and Postgres with pgvector and pg_trgm. The commands below use Docker Compose
+to provide Postgres 17. To run the entire service in Docker, use the
+[container setup](#docker-service-with-local-ocr); no host Bun installation is needed.
 
 ```bash
 bun install
@@ -73,9 +81,9 @@ export CONTEXTUAL_EMBED_MODEL=qwen3-embedding:0.6b
 bun run src/cli/contextual.ts reindex
 ```
 
-Keep Ollama running and set the same environment on the MCP server. This model
-is a ~639 MB download and produces the 1024-dimensional vectors used by the
-database. No API key is needed. See [local setup](USAGE.md#local-embeddings-with-ollama)
+Keep Ollama running and set the same environment on the MCP server. The service
+requests and validates the 1024-dimensional vectors used by the database.
+No API key is needed. See [local setup](USAGE.md#local-embeddings-with-ollama)
 for startup and configuration.
 
 Alternatively, use Voyage:
@@ -156,10 +164,44 @@ docker compose --profile app run --rm app migrate
 docker compose --profile app up -d app
 ```
 
-Upload to `http://127.0.0.1:3000/api/ingest` with the bearer token. Compose uses
-full-text search by default; configure Ollama for local semantic search. See
-[local OCR and container configuration](USAGE.md#optional-scanned-pdfs-and-ocr)
-for dependencies, languages, processing limits, and pod settings.
+Upload to `http://127.0.0.1:3000/api/ingest` with the bearer token:
+
+```bash
+curl --fail-with-body http://127.0.0.1:3000/api/ingest \
+  -H "Authorization: Bearer $CONTEXTUAL_HTTP_TOKEN" \
+  -F 'files=@./scanned.pdf' -F 'collection=handbook'
+```
+
+Compose uses full-text search by default unless `CONTEXTUAL_EMBED_PROVIDER`
+is set in your environment or `.env`. For Ollama, set
+`CONTEXTUAL_EMBED_PROVIDER=ollama` and an address reachable
+from the container in `CONTEXTUAL_OLLAMA_URL`. The Compose default uses
+`host.docker.internal` for Docker Desktop; Linux and Kubernetes deployments
+should supply their Ollama service address.
+
+For a pod, provide `CONTEXTUAL_DATABASE_URL`, `CONTEXTUAL_HTTP_TOKEN`, and
+`CONTEXTUAL_HTTP_ALLOWED_HOSTS`, run migrations before serving a new database,
+and mount writable storage at `/app/blobs`. A read-only root filesystem also
+needs writable `/tmp` for OCR and native parser files. See
+[Docker and Kubernetes setup](USAGE.md#docker-and-kubernetes) for details.
+
+### Local OCR outside Docker
+
+Install Tesseract and Poppler, then enable local OCR for the CLI or server:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng poppler-utils
+# macOS: brew install tesseract poppler
+
+export CONTEXTUAL_OCR=local
+bun run src/cli/contextual.ts add ./scanned.pdf --collection handbook --force
+```
+
+English is the default. Additional languages require installed Tesseract data
+and `CONTEXTUAL_OCR_LANGUAGE`, for example `eng+deu`. OCR language selection is
+independent of the database's full-text search language.
 
 ## The namespace
 
@@ -181,7 +223,7 @@ This is the product, not an optimization, so it is enforced in code:
 
 - **L0 — `ctx://index` / `cx_ls("/")`** — every skill's name and description,
   every collection's summary and doc count. Only `ready` sources count as
-  documents; a scanned PDF is reported separately as not searchable, so the
+  documents; a PDF still requiring OCR is reported separately as not searchable, so the
   catalog never promises text it does not have. Hard budget: **≤2k tokens**. When the
   corpus outgrows it, descriptions are clipped before any entry is dropped, and
   anything held back is stated rather than silently omitted.
@@ -199,8 +241,9 @@ results truncate and return a pointer to read the rest — never a silent dump.
 
 ## Ingest
 
-`detect → (skill | document) → chunk → embed → write → notify`, with a content
-hash on `sources` making re-ingest idempotent.
+`detect → normalize → chunk → write → embed`, with a content hash on `sources`
+making re-ingest idempotent. Source writes complete before embedding; database
+triggers notify connected clients when changes commit.
 
 - **Skills** are validated against the real frontmatter spec: `name` ≤64 chars,
   lowercase/digits/hyphens, no XML tags, no reserved words; `description`
@@ -225,6 +268,11 @@ hash on `sources` making re-ingest idempotent.
   re-ingest also delete the binary assets they orphan, so the blob directory
   is cleaned after successful replacement. New blobs use unique staging directories;
   a failed transaction removes its staged files and preserves the previous source.
+- **Uploads retain logical identities.** HTTP originals are temporary, so stored
+  origins use `upload://docs/{collection}/{filename}` or `upload://skills/{name}`.
+  Uploading identical bytes under different document names keeps both sources;
+  reuploading the same name updates that source. Filesystem rename detection
+  does not reclaim uploaded sources.
 - **Documents** are normalized with [`@firecrawl/anydoc`](https://github.com/firecrawl/anydoc),
   which covers Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV and PDF
   through one document model. Format is detected from the **bytes**, not the
@@ -239,8 +287,8 @@ hash on `sources` making re-ingest idempotent.
   into row batches with repeated headers; fenced code remains atomic.
 - **Embedding** supports Voyage or a local Ollama endpoint. Ollama defaults to
   `qwen3-embedding:0.6b`, uses small sequential batches, adds the Qwen query
-  instruction, and validates 1024-dimensional outputs. Provider/model identities
-  are pinned separately to prevent incompatible vectors being mixed.
+  instruction, and validates 1024-dimensional outputs. Ollama's stored model
+  identity includes its provider to prevent incompatible vectors being mixed.
   Voyage sends `truncation: true` and batches by count *and*
   estimated tokens. A batch the API rejects is retried one chunk at a time, so
   one oversize code block leaves only itself without a vector instead of its whole
@@ -251,7 +299,7 @@ hash on `sources` making re-ingest idempotent.
   A smaller `add` pays the incremental cost rather than dropping an index other
   queries are using. The rebuild is in a `finally`, so a failed load cannot
   leave the corpus unindexed. Both providers have request timeouts. Voyage has bounded retries with
-  jitter, and support both forms of `Retry-After`. Authentication and input
+  jitter, and supports both forms of `Retry-After`. Authentication and input
   failures are classified separately. A failed embedding run leaves full-text
   retrieval available for a later `reindex`.
 
@@ -274,6 +322,16 @@ OCR dependencies, timeouts, and unreadable scanned pages fail explicitly without
 ingesting partial content. `CONTEXTUAL_OCR=hosted` is a separate opt-in that
 sends the file to Firecrawl Parse; **the file leaves your machine**. Local mode
 never falls back to hosted OCR.
+
+Local OCR processes one document at a time per service process, with one
+Tesseract thread and one page raster at a time. Pages are grayscale with their
+longest side scaled to 3500 pixels. Defaults are 60 seconds per subprocess,
+5 minutes per document after queue admission, and 200 total pages in a PDF
+requiring OCR. Native parser calls are checked against the document deadline
+between steps; they cannot be interrupted mid-call. Temporary files are removed
+after success or failure. Scanned pages yield text, without reconstructing
+table cells or heading levels. See [OCR configuration](USAGE.md#optional-scanned-pdfs-and-ocr)
+for limits and troubleshooting.
 
 ## Retrieval
 
@@ -317,8 +375,8 @@ listings aggregate immediate children in SQL and expose an `offset` continuation
 
 ## Security
 
-Uploaded skills and documents become *instructions* in an agent's context — a
-malicious skill is an agent hijack. Therefore:
+Skills supply instructions to the agent; retrieved documents are treated as
+untrusted data. The service enforces these boundaries:
 
 - **Uploaded scripts are never executed server-side.** They are read-only
   resources; execution stays with the client, in its own sandbox.
@@ -335,8 +393,9 @@ malicious skill is an agent hijack. Therefore:
   arrives from `cx_skill` or from `cx_read` of its URI, because an agent that
   follows a `resource_link` must not be told to disregard bytes it was just told
   to follow. A skill's reference, script and asset files are ordinary content and
-  stay enveloped. The trust boundary for skills is ingest-time validation plus
-  the human who ran `contextual add`.
+  stay enveloped. The trust boundary for skills includes the person or client
+  authorized to ingest them through the CLI or upload API; frontmatter validation
+  does not establish that a skill's instructions are trustworthy.
 - **`allowed-tools` is advisory.** It is stored and shown by `cx_skill` with a
   note that enforcement is the client's job; this server cannot stop a skill
   from asking for Bash.
@@ -351,6 +410,10 @@ malicious skill is an agent hijack. Therefore:
 
 ```
 db/migrations/             001–005: schema, retrieval context, URIs, notifications
+fixtures/                  # sample documents and retrieval evaluation data
+scripts/                   # evaluation, binary smoke checks, fixture generation
+Dockerfile                 # compiled service + Tesseract + Poppler
+docker-compose.yml         # Postgres; optional app profile for the HTTP service
 src/
   core/                     # transport-agnostic — survives the move to hosted
     db.ts                   # Bun.sql + pgvector + settings + migrations
@@ -360,7 +423,7 @@ src/
     search/  hybrid rrf
     catalog/ index watch
   mcp/       server http http-body uploads resources tools format
-  cli/       contextual.ts
+  cli/       contextual.ts commands.ts
 test/                       # bun test
 ```
 
@@ -384,7 +447,13 @@ exception when a client disconnects abruptly.
 
 Migrations are embedded as text imports, so checkout paths with spaces and the
 standalone executable use the same SQL. Each migration and its tracking record
-commit in one transaction. The explicit `pgArray()` literal remains for stable
+commit in one transaction. Fresh installs create pgvector and pg_trgm in the
+`public` schema so separate corpus schemas can resolve their types and operators.
+Include `public` in the database connection's `search_path` when using a custom
+corpus schema. The migration role must be able to install these extensions, or
+an administrator can install them beforehand.
+
+The explicit `pgArray()` literal remains for stable
 binding behavior: the Bun 1.4.2 probe still showed double-quoted values from
 `sql.array()`, while the literal helper passes the round-trip regression.
 
@@ -441,7 +510,7 @@ bun test          # unit + real Postgres + both MCP protocol eras
 bun run typecheck
 bun run lint
 bun run eval      # isolated, offline retrieval smoke evaluation
-bun run test:binary # compile and test migrations, native DOCX ingest, and MCP
+bun run test:binary # compile and test migrations, DOCX/OCR ingest, and stdio/HTTP
 ```
 
 The integration and server suites create a throwaway Postgres schema, ingest real
@@ -456,19 +525,28 @@ Local OCR tests exercise real scanned and mixed PDFs when Tesseract and Poppler
 are installed; CI installs them and sets `CONTEXTUAL_REQUIRE_OCR_TESTS=1`.
 `bun run scripts/make-ocr-fixture.ts` regenerates the image-only text fixture.
 
+Keep `fixtures/` in the repository: parsing, OCR, upload, binary smoke, and
+retrieval evaluation checks depend on it. It is excluded from the Docker build
+context and npm package, so it is not required in a running service.
+
 ## Upgrading an existing corpus
 
 ```bash
 bun install
 bun run migrate
-bun run src/cli/contextual.ts reindex --all   # requires VOYAGE_API_KEY
+# If the embedding provider/model changed, configure Voyage or Ollama first:
+bun run src/cli/contextual.ts reindex --all
 ```
 
 Migration 003 removes file-level FTS, adds indexed chunk context, and clears
 old embeddings so they can be regenerated consistently. Full-text search remains
 available throughout. Migration 004 rewrites existing URIs canonically;
-migration 005 installs change notifications. The default model is now `voyage-4`;
-a corpus pinned to the old model requires `reindex --all` to switch.
+migration 005 installs change notifications. Run `reindex` to fill missing
+vectors with the existing provider/model, or `reindex --all` to switch providers
+or models. Full-text-only installations do not need an embedding reindex.
+To apply parser or OCR changes to existing documents, re-add their originals
+with `--force` or reupload them with `force=true`; reindexing does not reparse
+documents. Restart the service after updating its code or image.
 
 ## Distribution and evaluation
 
@@ -494,6 +572,8 @@ same defaults. Invalid values fail with the setting name instead of becoming NaN
 | Variable | Default / purpose |
 |---|---|
 | `CONTEXTUAL_DATABASE_URL` | Local Docker Postgres on port 55432 |
+| `CONTEXTUAL_HTTP_TOKEN` | Unset; bearer token required when HTTP binds outside loopback |
+| `CONTEXTUAL_HTTP_ALLOWED_HOSTS` | Localhost addresses for loopback binds, otherwise the bind hostname; explicit hostnames/IPs without ports required for wildcard binds |
 | `VOYAGE_API_KEY` | Optional Voyage authentication |
 | `CONTEXTUAL_EMBED_PROVIDER` | `voyage` (default), `ollama`, or `none`; Voyage without a key uses full-text only |
 | `CONTEXTUAL_OLLAMA_URL` | `http://127.0.0.1:11434`; Ollama base URL |
@@ -503,7 +583,7 @@ same defaults. Invalid values fail with the setting name instead of becoming NaN
 | `CONTEXTUAL_OCR` | `reject` outside Docker; image defaults to `local` (Tesseract + Poppler); `hosted` opts into Firecrawl |
 | `CONTEXTUAL_OCR_LANGUAGE` | `eng`; installed Tesseract languages, e.g. `eng+deu` |
 | `FIRECRAWL_API_KEY` | Hosted OCR authentication |
-| `CONTEXTUAL_BLOB_DIR` | `./blobs` |
+| `CONTEXTUAL_BLOB_DIR` | `./blobs`; `/app/blobs` in the Docker image |
 | `CONTEXTUAL_RERANK` | `false`; enables external passage reranking |
 | `CONTEXTUAL_RERANK_MODEL` | `rerank-2.5-lite` |
 | `CONTEXTUAL_SEARCH_TIMEOUT_MS` | 10000; allowed 1–3600000 |
