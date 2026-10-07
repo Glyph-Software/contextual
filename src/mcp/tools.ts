@@ -15,16 +15,25 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/server';
 import type { ContentBlock } from '@modelcontextprotocol/server';
 import { loadCatalog, renderCatalog } from '../core/catalog/index';
-import { listPath, renderListing } from '../core/vfs/list';
+import { listPath, renderListing, listingEntryRenderer } from '../core/vfs/list';
 import { glob } from '../core/vfs/glob';
-import { grep, GrepTooExpensiveError } from '../core/vfs/grep';
-import { searchWithDiagnostics, SearchTooExpensiveError } from '../core/search/hybrid';
-import { searchSkills } from '../core/search/skills';
+import { grepPage, GrepTooExpensiveError } from '../core/vfs/grep';
+import { searchWithDiagnostics, SearchTooExpensiveError, type Hit } from '../core/search/hybrid';
+import { searchSkills, type SkillHit } from '../core/search/skills';
+import type { RetrievalDiagnostics } from '../core/search/diagnostics';
+import { sqlState, UNDEFINED_COLUMN, UNDEFINED_TABLE } from '../core/db';
 import { InputError } from '../core/errors';
 import { resolveNode, resolveChunk, chunkNeighbors, skillByName, nodesOfSource } from '../core/vfs/resolve';
 import { INDEX_URI, parseUri, pathToUri, buildUri, UriError } from '../core/vfs/uri';
 import { BUDGET, MAX_INLINE_BLOB_BYTES, cap, envelope, errorResult, resourceLink, result, text, log } from './format';
-import { CursorError, continuation, decodeCursor, encodeCursor, fingerprint, fitEntries, textPage } from './pagination';
+import { CursorError, continuation, decodeCursor, encodeCursor, fitEntries, textPage } from './pagination';
+import { decodeGrepCursor, encodeGrepCursor } from './grep-cursor';
+import { SearchPages } from './search-pages';
+import { safeContentEnd, SUPPRESSION_NOTICE, suppressUnsafeTail } from './content-safety';
+
+type PassageDisplay = Pick<Hit, 'uri' | 'path' | 'headingPath' | 'snippet' | 'sourceName'>;
+type SearchSnapshot = { target: 'skills'; hits: SkillHit[] } | ({ target: 'passages'; hits: PassageDisplay[] } & RetrievalDiagnostics);
+const searchPages = new SearchPages<SearchSnapshot>();
 
 const cursorInput = z.string().max(512).optional().describe('Opaque next_cursor from the previous response; keep the other arguments unchanged');
 const pageOutput = z.looseObject({
@@ -59,7 +68,7 @@ export function registerTools(server: McpServer): void {
         }
         const listing = await listPath(path, { offset: start });
         if (listing.missing) return errorResult(renderListing(listing));
-        const page = fitEntries(listing.entries, (e) => `  ${e.name}  ${e.note ?? ''}`, BUDGET.ls - 256);
+        const page = fitEntries(listing.entries, listingEntryRenderer(listing.entries), BUDGET.ls - 256);
         const more = page.entries.length < listing.entries.length || listing.nextOffset !== undefined;
         const next = more ? encodeCursor(key, start + page.entries.length) : null;
         const blocks: ContentBlock[] = [text(`${listing.path}\n${page.body || '(empty)'}` + continuation('cx_ls', { path }, next))];
@@ -127,23 +136,24 @@ export function registerTools(server: McpServer): void {
       try {
         const args = { pattern, path_glob, ignore_case, limit };
         const key = `grep:${JSON.stringify(args)}`;
-        const start = decodeCursor(cursor, key) ?? 0;
-        const matches = await grep(pattern, { pathGlob: path_glob, ignoreCase: ignore_case, maxMatches: limit + 1, offset: start });
-        if (!matches.length) {
+        const scan = await grepPage(pattern, { pathGlob: path_glob, ignoreCase: ignore_case, maxMatches: limit, after: decodeGrepCursor(cursor, key) });
+        const matches = scan.matches;
+        if (!matches.length && !scan.next) {
           return result(
             `No matches for /${pattern}/${path_glob ? ` under ${path_glob}` : ''}.` +
               (path_glob ? ' Paths are VFS paths, as shown by cx_ls — e.g. "/skills/{name}/**".' : ''), { next_cursor: null, returned: 0 },
           );
         }
         const page = fitEntries(matches.slice(0, limit), (m) => `${m.path}:${m.line}: ${m.text}`, BUDGET.grep - 256);
-        const next = matches.length > page.entries.length ? encodeCursor(key, start + page.entries.length) : null;
+        const last = page.entries.at(-1);
+        const next = encodeGrepCursor(key, last && page.entries.length < matches.length ? { nodeId: last.nodeId, line: last.line } : scan.next);
         // Matching lines are document content, so they are framed as data for
         // the same reason cx_read and cx_search are: a line lifted out of an
         // uploaded PDF is not an instruction.
         return result([
           text(envelope(page.body, { pattern, matches: page.entries.length, ...(path_glob && { path_glob }) }) + continuation('cx_grep', args, next)),
           ...dedupeLinks(page.entries.map((m) => resourceLink(m.uri, m.path))).slice(0, 20),
-        ], { next_cursor: next, returned: page.entries.length });
+        ], { next_cursor: next, returned: page.entries.length, scanned_files: scan.scannedFiles, content_suppressed: safeContentEnd(page.body) < page.body.length });
       } catch (err) {
         return toolError(err);
       }
@@ -170,7 +180,7 @@ export function registerTools(server: McpServer): void {
     async ({ uri, offset, limit, cursor }) => {
       try {
         const target = uri.startsWith('ctx://') ? uri : pathToUri(uri);
-        if (!target) return errorResult(`Not a readable path: ${uri}. Use cx_ls("/") to see what exists.`);
+        if (!target) return errorResult(`Not a readable path: ${uri}.`, 'INVALID_ARGUMENT');
 
         if (target === INDEX_URI) {
           if (cursor) throw new CursorError('The index is a summary. Use cx_ls to browse /skills or /docs.');
@@ -181,7 +191,7 @@ export function registerTools(server: McpServer): void {
         if (parsed.chunk !== undefined) return await readChunk(canonical, { offset, limit, cursor });
 
         const node = await resolveNode(target);
-        if (!node) return errorResult(`No such resource: ${target}. Use cx_ls to find the right path.`);
+        if (!node) return errorResult(`No such resource: ${target}.`);
 
         // A binary asset is returned inline — as an image block when it is
         // one, otherwise as an embedded resource — because Resources are
@@ -193,18 +203,16 @@ export function registerTools(server: McpServer): void {
           return await readBlob(target, node);
         }
 
-        const page = textPage(node.content, `read:${canonical}`, BUDGET.read - 256, { offset, limit, cursor });
-        const firstLine = node.content.slice(0, page.start).split('\n').length;
-        const returnedLines = page.text ? page.text.replace(/\n$/, '').split('\n').length : 0;
-        const lines = returnedLines ? `${firstLine}-${firstLine + returnedLines - 1} of ${node.content.split('\n').length}` : 'no lines returned';
-        const meta = { uri: canonical, source: node.sourceName, role: node.role, lines, start_character: page.start, end_character: page.end };
+        const page = textPage(node.content, `read:${canonical}`, BUDGET.read - 256, { offset, limit, cursor, revision: node.revision, untrusted: node.role !== 'skill_md' });
+        const lines = page.text ? `${page.firstLine}-${page.lastLine} of ${page.totalLines}` : 'no lines returned';
+        const meta = { uri: canonical, source: node.sourceName, role: node.role, lines, start_character: page.start, end_character: page.end, content_suppressed: page.contentSuppressed };
         // The trust split is by *content kind*, not by which tool was called.
         // A SKILL.md is instructions whether it arrives via cx_skill or via a
         // resource_link followed with cx_read; wrapping it here in "do not
         // follow this" would make the same bytes mean two different things.
         const body = node.role === 'skill_md'
           ? `${Object.entries(meta).map(([k, v]) => `${k}: ${v}`).join('\n')}\n---\n${page.text}`
-          : envelope(page.text, meta);
+          : envelope(page.text + (page.contentSuppressed && !page.nextCursor ? SUPPRESSION_NOTICE : ''), meta);
         return result([
           text(body + continuation('cx_read', { uri: canonical, ...(limit && { limit }) }, page.nextCursor)),
           resourceLink(target, node.path, node.role, node.mimeType ?? 'text/plain'),
@@ -242,22 +250,32 @@ export function registerTools(server: McpServer): void {
       try {
         const args = { queries, scope, limit, target };
         const key = `search:${JSON.stringify(args)}`;
-        if (target === 'skills') {
-          const hits = await searchSkills(queries, { scope, limit });
-          const revision = fingerprint(JSON.stringify(hits));
-          const start = decodeCursor(cursor, key, revision) ?? 0;
+        const saved = cursor === undefined ? undefined : searchPages.read(cursor, key);
+        let snapshot: SearchSnapshot;
+        if (saved) snapshot = saved.value;
+        else if (target === 'skills') snapshot = { target, hits: await searchSkills(queries, { scope, limit }) };
+        else {
+          const { hits, ...diagnostics } = await searchWithDiagnostics(queries, { limit, scope });
+          snapshot = { target, ...diagnostics, hits: hits.map(({ uri, path, headingPath, snippet, sourceName }) => ({ uri, path, headingPath, snippet, sourceName })) };
+        }
+        const start = saved?.start ?? 0;
+        if (start > snapshot.hits.length) throw new CursorError('Search cursor is past the last result.');
+        const nextCursor = (count: number) => start + count < snapshot.hits.length
+          ? searchPages.cursor(key, saved?.id ?? searchPages.save(key, snapshot), start + count) : null;
+        if (snapshot.target === 'skills') {
+          const { hits } = snapshot;
           const page = fitEntries(hits.slice(start), (h, i) => `${start + i + 1}. ${h.name}\n   ${h.description}\n   Load with cx_skill(${JSON.stringify({ name: h.name })})\n   ${h.uri}\n`, BUDGET.search - 256);
-          const next = start + page.entries.length < hits.length ? encodeCursor(key, start + page.entries.length, revision) : null;
+          const next = nextCursor(page.entries.length);
           return result([
             text((hits.length ? envelope(page.body, { target: 'skill metadata', hits: page.entries.length }) : 'No skills matched. Try different purpose words or browse cx_ls("/skills").') + continuation('cx_search', args, next)),
-            ...page.entries.map((h) => resourceLink(h.uri, h.name, h.description, 'text/markdown')),
+            ...page.entries.map((h) => resourceLink(h.uri, h.name, suppressUnsafeTail(h.description), 'text/markdown')),
           ], { retrieval_mode: 'skill_metadata', warnings: [], next_cursor: next, returned: page.entries.length,
+            content_suppressed: safeContentEnd(page.body) < page.body.length,
             skills: page.entries.map((h) => ({ name: h.name, uri: h.uri, next_call: { tool: 'cx_skill', arguments: { name: h.name } } })) });
         }
-        const { hits, ...diagnostics } = await searchWithDiagnostics(queries, { limit, scope });
+        const { hits, retrieval_mode, warnings } = snapshot;
+        const diagnostics = { retrieval_mode, warnings };
         const status = `Retrieval: ${diagnostics.retrieval_mode}.\n` + diagnostics.warnings.map((w) => `${w.code}: ${w.message} ${w.suggested_action}\n`).join('');
-        const revision = fingerprint(JSON.stringify(hits.map((h) => [h.uri, h.snippet])));
-        const start = decodeCursor(cursor, key, revision) ?? 0;
         if (!hits.length) {
           return result(
             status + `No passages found for ${queries.map((q) => JSON.stringify(q)).join(', ')}` +
@@ -269,11 +287,11 @@ export function registerTools(server: McpServer): void {
             const where = h.headingPath?.length ? ` › ${h.headingPath.join(' › ')}` : '';
             return `${start + i + 1}. ${h.path}${where}\n   ${h.snippet.replace(/\s+/g, ' ').trim()}\n   ${h.uri}\n`;
           }, BUDGET.search - 512);
-        const next = start + page.entries.length < hits.length ? encodeCursor(key, start + page.entries.length, revision) : null;
+        const next = nextCursor(page.entries.length);
         return result([
           text(status + envelope(page.body, { queries: queries.join(' | '), hits: page.entries.length }) + continuation('cx_search', args, next)),
-          ...page.entries.map((h) => resourceLink(h.uri, `${h.sourceName}${h.headingPath?.length ? ` › ${h.headingPath.at(-1)}` : ''}`, h.snippet.replace(/\*\*/g, '').slice(0, 160), 'text/markdown')),
-        ], { ...diagnostics, next_cursor: next, returned: page.entries.length });
+          ...page.entries.map((h) => resourceLink(h.uri, suppressUnsafeTail(`${h.sourceName}${h.headingPath?.length ? ` › ${h.headingPath.at(-1)}` : ''}`), suppressUnsafeTail(h.snippet).replace(/\*\*/g, '').slice(0, 160), 'text/markdown')),
+        ], { ...diagnostics, next_cursor: next, returned: page.entries.length, content_suppressed: safeContentEnd(page.body) < page.body.length });
       } catch (err) {
         return toolError(err);
       }
@@ -296,8 +314,7 @@ export function registerTools(server: McpServer): void {
       try {
         const skill = await skillByName(name);
         if (!skill) {
-          const listing = await listPath('/skills');
-          return errorResult(`No skill named "${name}". Available:\n${cap(renderListing(listing), BUDGET.ls, 'Use cx_ls("/skills") to browse.').text}`);
+          return errorResult(`No skill named "${name}".`, 'NOT_FOUND', 'Use cx_ls({"path":"/skills"}) to browse available skills.');
         }
         const md = await resolveNode(buildUri('skills', name, 'SKILL.md'));
         const files = await nodesOfSource(skill.sourceId);
@@ -355,16 +372,17 @@ async function readChunk(uri: string, opts: { offset?: number; limit?: number; c
     chunk.content,
     ...after.map((n) => `${n.content}…`),
   ].join('\n\n');
-  const page = textPage(body, `read:${uri}`, BUDGET.read - 256, opts);
+  const page = textPage(body, `read:${uri}`, BUDGET.read - 256, { ...opts, untrusted: true, revision: [chunk.revision, ...neighbors.map((n) => n.revision)].join(',') });
   return result([
-    text(envelope(page.text, {
+    text(envelope(page.text + (page.contentSuppressed && !page.nextCursor ? SUPPRESSION_NOTICE : ''), {
       uri,
       source: chunk.node.sourceName,
       heading: chunk.headingPath,
       note: 'neighbouring chunks included for context',
+      content_suppressed: page.contentSuppressed,
     }) + continuation('cx_read', { uri, ...(opts.limit && { limit: opts.limit }) }, page.nextCursor)),
     resourceLink(chunk.node.uri, chunk.node.path, 'full document', 'text/markdown'),
-  ], { next_cursor: page.nextCursor, start_character: page.start, end_character: page.end });
+  ], { next_cursor: page.nextCursor, start_character: page.start, end_character: page.end, content_suppressed: page.contentSuppressed });
 }
 
 async function readBlob(target: string, node: Awaited<ReturnType<typeof resolveNode>> & {}) {
@@ -412,8 +430,7 @@ function toolError(err: unknown) {
     return errorResult(`Too expensive: ${err.message}`, 'QUERY_TIMEOUT', err.message);
   }
   log('tool error:', err);
-  const e = err as { code?: string; errno?: string };
-  if ([e.code, e.errno].some((code) => code === '42P01' || code === '42703')) {
+  if ([UNDEFINED_TABLE, UNDEFINED_COLUMN].includes(sqlState(err) ?? '')) {
     return errorResult('The database schema is not up to date.', 'MIGRATIONS_REQUIRED', 'Run contextual migrate against the server database.');
   }
   return errorResult('contextual could not complete the request.', 'SERVICE_ERROR', 'Run contextual doctor and check the server logs before retrying.', true);

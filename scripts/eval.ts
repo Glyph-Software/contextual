@@ -1,5 +1,6 @@
 /** An isolated, reproducible retrieval evaluation. --voyage sends only fixtures. */
 import { SQL } from 'bun';
+import { voyageKey } from '../src/core/config';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -39,7 +40,7 @@ try {
   for (const question of fixture.questions) rankings.push((await search(question.queries, { limit: 5 })).map((h) => h.sourceName));
   records.push({ mode: 'fts-context-prefix', ...metric(rankings), elapsedMs: Math.round(performance.now() - start) });
   if (process.argv.includes('--voyage')) {
-    const key = process.env.VOYAGE_API_KEY ?? process.env.CONTEXTUAL_VOYAGE_API_KEY;
+    const key = voyageKey();
     if (!key) throw new Error('--voyage requires VOYAGE_API_KEY');
     const groups = fixture.documents.map((d) => chunkBlocks(blocksFromMarkdown(d.content)));
     const passages = groups.flatMap((chunks, i) => chunks.map((chunk) => ({ name: fixture.documents[i]!.name, text: chunk.content, prefix: [fixture.documents[i]!.name, ...chunk.headingPath].join(' / ') })));

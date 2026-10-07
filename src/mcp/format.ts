@@ -11,6 +11,8 @@
  *    never a silent dump.
  */
 import type { CallToolResult, ContentBlock } from '@modelcontextprotocol/server';
+import { ENVELOPE_TAG, safeContentEnd, suppressUnsafeTail } from './content-safety';
+export { ENVELOPE_TAG } from './content-safety';
 
 export function log(...parts: unknown[]): void {
   const line = parts
@@ -61,9 +63,6 @@ export function cap(text: string, budgetTokens: number, hint?: string): Capped {
 /** Binary assets larger than this are described, not inlined, by `cx_read`. */
 export const MAX_INLINE_BLOB_BYTES = 3 * 1024 * 1024;
 
-export const ENVELOPE_TAG = 'contextual-content';
-const ENVELOPE_CLOSE = new RegExp(`</${ENVELOPE_TAG}\\b`, 'gi');
-
 /**
  * Retrieved *documents* are data an agent is reasoning about, not instructions
  * it should follow, so document reads, search hits and grep hits are wrapped
@@ -72,12 +71,12 @@ const ENVELOPE_CLOSE = new RegExp(`</${ENVELOPE_TAG}\\b`, 'gi');
  * two in one frame would make the model either ignore the skill or obey the
  * PDF.
  *
- * Escape the envelope's own closing delimiter if it appears in retrieved text.
- * Cutting there would discard content that a continuation cursor has already
- * advanced past. Escaping keeps the tail available without nested framing.
+ * Suppress embedded closing delimiters and their tails. Paged reads apply the
+ * same check before slicing; a continuation cannot reveal the suppressed tail.
  */
 export function envelope(body: string, meta?: Record<string, unknown>): string {
-  body = body.replace(ENVELOPE_CLOSE, (delimiter) => `&lt;${delimiter.slice(1)}`);
+  if (safeContentEnd(body) < body.length) meta = { ...meta, content_suppressed: true };
+  body = suppressUnsafeTail(body);
   const head = meta
     ? Object.entries(meta)
         .filter(([, v]) => v !== undefined && v !== null && v !== '')

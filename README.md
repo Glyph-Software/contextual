@@ -74,6 +74,8 @@ bun run src/cli/contextual.ts init --output /path/to/your/project/.mcp.json
 
 `init` merges the contextual entry with absolute executable and storage paths,
 creates blob storage, and verifies a real MCP discovery/catalog round trip.
+It saves only an allowlist of nonsecret stdio settings; configure credentials and
+database/provider URLs through your MCP host's environment or secret settings.
 Existing unrelated entries are preserved; replacing a different contextual
 entry requires `--force`. `doctor --json` provides machine-readable checks for
 the runtime, configuration, database, migrations, storage and embedding provider.
@@ -256,6 +258,9 @@ outside the content body. Cursors preserve long lines and Unicode characters;
 directory offsets advance only past entries actually returned. Existing line
 offsets remain accepted by `cx_read`. `cx_skill`, `cx_glob`, and `cx_grep` also
 support cursors; search cursors continue the selected ranked result set.
+Search pages reuse a bounded, five-minute snapshot, so continuation does not
+repeat embedding or reranking requests. Safety-filtered document tails are
+explicitly marked as suppressed and cannot be retrieved through a continuation.
 
 ## Ingest
 
@@ -403,8 +408,9 @@ support `*`, `**`, `?`, braces, and character classes; malformed or nested brace
 patterns fail explicitly. Exact matching happens before SQL limits. Directory
 listings aggregate immediate children in SQL. Cursor pages advance past only
 the entries that fit the response; legacy `offset` calls are still accepted.
-Grep pagination covers all matching files under the statement timeout, instead
-of silently stopping after 200 candidate files.
+Grep splits at most 200 candidate files per call and continues by file ID and
+line number. Pages can reach all matching files without rescanning completed
+files; the statement timeout still bounds regex matching and large-file work.
 
 ## Security
 
@@ -419,8 +425,11 @@ untrusted data. The service enforces these boundaries:
   URIs from addressing one node.
 - Retrieved **documents, search hits and grep hits** are framed as **data, not
   instructions**, in an `<contextual-content untrusted>` envelope. A body that
-  contains the envelope's closing delimiter has that delimiter escaped as
-  `&lt;`, preserving the rest of the content and its continuation position.
+  contains the envelope's closing delimiter has that delimiter and its tail
+  suppressed, with an explicit notice and `content_suppressed` metadata.
+  Document reads check this boundary before paging, so offsets and continuations
+  cannot reveal the suppressed tail. Ordinary text pages preserve their content;
+  safety-filtered responses are not lossless copies.
   Metadata is escaped too, including headings and filenames.
 - **Skills are instructions, and are returned bare.** The split is by *content
   kind*, not by which tool was called: `SKILL.md` is instructions whether it

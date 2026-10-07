@@ -99,13 +99,17 @@ export async function listPath(input: string, opts: { offset?: number; limit?: n
     : { name: r.name, type: 'file', uri: r.uri, note: r.role, sizeBytes: r.size }));
 }
 
+export function listingEntryRenderer(entries: Entry[]): (entry: Entry) => string {
+  const width = Math.max(0, ...entries.map((e) => e.name.length));
+  return (e) => `  ${e.name.padEnd(width)}  ${e.note ?? ''}`.trimEnd();
+}
+
+/** Continuation instructions belong to the tool's cursor-aware formatter. */
 export function renderListing(l: Listing): string {
-  if (l.missing) return `${l.path}: no such path. Try cx_ls("/") for the catalog.`;
+  if (l.missing) return `${l.path}: no such path.`;
   if (l.entries.length === 0) return `${l.path}: empty`;
-  const width = Math.max(...l.entries.map((e) => e.name.length));
   return [
     l.path,
-    ...l.entries.map((e) => `  ${e.name.padEnd(width)}  ${e.note ?? ''}`.trimEnd()),
-    ...(l.nextOffset === undefined ? [] : [`More entries: cx_ls(${JSON.stringify(l.path)}, offset=${l.nextOffset})`]),
+    ...l.entries.map(listingEntryRenderer(l.entries)),
   ].join('\n');
 }

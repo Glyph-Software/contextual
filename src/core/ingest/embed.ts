@@ -13,7 +13,7 @@
  * Skills need no embeddings at all, so a user can run the whole skill path with
  * zero credentials.
  */
-import { embedProvider, envNumber } from '../config';
+import { embedProvider, envNumber, voyageKey } from '../config';
 import { EmbeddingError, voyageRequest, type RequestOptions } from './voyage';
 
 export const EMBED_DIMS = 1024;
@@ -161,7 +161,7 @@ export function getEmbedder(): Embedder | null {
   const provider = embedProvider();
   if (provider === 'none') return cached = null;
   if (provider === 'ollama') return cached = new OllamaEmbedder();
-  const key = process.env.VOYAGE_API_KEY ?? process.env.CONTEXTUAL_VOYAGE_API_KEY;
+  const key = voyageKey();
   cached = key ? new VoyageEmbedder(key) : null;
   return cached;
 }

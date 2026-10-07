@@ -8,6 +8,8 @@ import { parseUri, buildUri, type CtxUri } from './uri';
 
 export interface ResolvedNode {
   id: number;
+  /** Row identity/version changes on replacement or UPDATE, without hashing text. */
+  revision: string;
   sourceId: number;
   uri: string;
   path: string;
@@ -24,6 +26,7 @@ export interface ResolvedNode {
 
 export interface ResolvedChunk {
   id: number;
+  revision: string;
   ord: number;
   headingPath: string[];
   content: string;
@@ -39,7 +42,7 @@ export async function resolveNode(uri: string): Promise<ResolvedNode | null> {
   const canonical = buildUri(parsed.realm, parsed.root, parsed.path);
   const sql = db();
   const rows = (await sql`
-    SELECT n.id, n.source_id AS "sourceId", n.uri, n.path, n.role, n.mime_type AS "mimeType",
+    SELECT n.id, n.id::text || ':' || n.xmin::text AS revision, n.source_id AS "sourceId", n.uri, n.path, n.role, n.mime_type AS "mimeType",
            n.size_bytes AS "sizeBytes", n.content, n.blob_ref AS "blobRef",
            s.kind AS "sourceKind", s.name AS "sourceName", s.collection, s.status
     FROM nodes n JOIN sources s ON s.id = n.source_id
@@ -60,7 +63,7 @@ export async function resolveChunk(uri: string): Promise<ResolvedChunk | null> {
 
   const sql = db();
   const rows = (await sql`
-    SELECT id, ord, heading_path AS "headingPath", content, token_count AS "tokenCount"
+    SELECT id, id::text || ':' || xmin::text AS revision, ord, heading_path AS "headingPath", content, token_count AS "tokenCount"
     FROM chunks WHERE node_id = ${node.id} AND ord = ${parsed.chunk}
   `) as unknown as Omit<ResolvedChunk, 'node' | 'uri'>[];
   const row = rows[0];
@@ -71,11 +74,11 @@ export async function resolveChunk(uri: string): Promise<ResolvedChunk | null> {
 export async function chunkNeighbors(nodeId: number, ord: number, radius = 1) {
   const sql = db();
   return (await sql`
-    SELECT ord, heading_path AS "headingPath", content
+    SELECT ord, id::text || ':' || xmin::text AS revision, heading_path AS "headingPath", content
     FROM chunks
     WHERE node_id = ${nodeId} AND ord BETWEEN ${ord - radius} AND ${ord + radius} AND ord <> ${ord}
     ORDER BY ord
-  `) as unknown as { ord: number; headingPath: string[]; content: string }[];
+  `) as unknown as { ord: number; revision: string; headingPath: string[]; content: string }[];
 }
 
 export async function skillByName(name: string) {

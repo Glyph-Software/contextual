@@ -5,9 +5,9 @@ import { constants } from 'node:fs';
 import { access, lstat, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseArgs } from 'node:util';
+import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { validateConfig, embedProvider } from '../core/config';
+import { validateConfig, embedProvider, voyageKey } from '../core/config';
 import { DEFAULT_URL } from '../core/db';
 import { migrations } from '../core/migrations';
 import pkg from '../../package.json';
@@ -23,7 +23,7 @@ export function compatibleRuntime(version: string): boolean {
   return true;
 }
 
-export async function doctor(): Promise<DoctorReport> {
+export async function doctor(opts: { removeProbe?: typeof unlink } = {}): Promise<DoctorReport> {
   const checks: Check[] = [];
   const add = (name: string, status: Check['status'], message: string, suggested_action?: string) => checks.push({ name, status, message, ...(suggested_action && { suggested_action }) });
   add('runtime', compatibleRuntime(Bun.version) ? 'ok' : 'error', `Bun ${Bun.version}; requires >=${MIN_BUN_VERSION}.`,
@@ -47,45 +47,62 @@ export async function doctor(): Promise<DoctorReport> {
     const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
     add('blob_storage', missing ? 'warning' : 'error', missing ? `Not created yet: ${blobDir}` : `Cannot read and write blob storage: ${blobDir}`,
       missing ? 'Run contextual init to create the blob directory.' : 'Set CONTEXTUAL_BLOB_DIR to a readable, writable directory.');
-  } finally { if (probe) await unlink(probe); }
+  } finally {
+    if (probe) try { await (opts.removeProbe ?? unlink)(probe); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        add('blob_cleanup', 'error', `Could not remove the storage probe: ${probe}`, 'Check directory permissions and remove the probe file.');
+      }
+    }
+  }
 
   let sql: SQL | undefined;
   let pinned: string | null = null;
+  let stage = 'database';
   try {
     const url = new URL(process.env.CONTEXTUAL_DATABASE_URL ?? DEFAULT_URL);
     if (!['postgres:', 'postgresql:'].includes(url.protocol)) throw new Error();
     sql = new SQL({ url: url.href, connectionTimeout: 2, max: 1 });
     await sql`SELECT 1`;
     add('database', 'ok', `Connected to ${url.hostname}:${url.port || '5432'}${url.pathname}.`);
+    stage = 'database_transaction';
     await sql.begin(async (tx: any) => {
+      stage = 'extensions';
       await tx`SET LOCAL statement_timeout = '3s'`;
       const extensions = await tx`SELECT extname FROM pg_extension WHERE extname IN ('vector', 'pg_trgm')` as { extname: string }[];
       const missing = ['vector', 'pg_trgm'].filter((name) => !extensions.some((e) => e.extname === name));
       add('extensions', missing.length ? 'error' : 'ok', missing.length ? `Missing extensions: ${missing.join(', ')}.` : 'pgvector and pg_trgm are installed.',
         missing.length ? 'Use the provided Postgres image and run contextual migrate.' : undefined);
+      stage = 'migrations';
       const [table] = await tx`SELECT to_regclass('_migrations') AS name`;
       const applied = new Set(table.name ? (await tx`SELECT name FROM _migrations`).map((r: { name: string }) => r.name) : []);
       const pending = Object.keys(migrations).filter((name) => !applied.has(name));
       add('migrations', pending.length ? 'error' : 'ok', pending.length ? `Pending: ${pending.join(', ')}.` : 'Database migrations are up to date.',
         pending.length ? 'Run contextual migrate against this database.' : undefined);
       if (!pending.length) {
+        stage = 'settings';
         const settings = await tx`SELECT key, value FROM settings WHERE key IN ('embed_model', 'fts_config')` as { key: string; value: string }[];
+        add('settings', 'ok', 'Database retrieval settings are readable.');
         pinned = settings.find((row) => row.key === 'embed_model')?.value ?? null;
         const language = settings.find((row) => row.key === 'fts_config')?.value;
         if (process.env.CONTEXTUAL_FTS_LANGUAGE && language !== process.env.CONTEXTUAL_FTS_LANGUAGE.toLowerCase()) {
           add('fts_language', 'error', 'CONTEXTUAL_FTS_LANGUAGE differs from the database language.', 'Use the database language; changing it requires a new database.');
         }
       }
+      stage = 'database_transaction';
     });
   } catch {
     // Driver errors can contain the full connection string. Never echo them.
-    add('database', 'error', 'Could not complete the Postgres checks.', 'Start docker compose up -d; check CONTEXTUAL_DATABASE_URL, permissions, and run contextual migrate.');
-  } finally { await sql?.close(); }
+    add(stage, 'error', `Could not complete the Postgres ${stage} check.`, 'Start docker compose up -d; check CONTEXTUAL_DATABASE_URL, permissions, and run contextual migrate.');
+  } finally {
+    try { await sql?.close(); }
+    catch { add('database_cleanup', 'error', 'Could not close the diagnostic database connection.'); }
+  }
 
   if (valid) {
     try {
       const provider = embedProvider();
-      const key = process.env.VOYAGE_API_KEY ?? process.env.CONTEXTUAL_VOYAGE_API_KEY;
+      const key = voyageKey();
       if (provider === 'none' || (provider === 'voyage' && !key)) {
         add('embeddings', 'ok', 'Full-text search enabled; semantic retrieval is not configured.');
       } else {
@@ -110,10 +127,19 @@ export async function doctor(): Promise<DoctorReport> {
 export function hostConfig(): { command: string; args: string[]; env: Record<string, string> } {
   const bundled = /\$bunfs|~BUN/.test(import.meta.url);
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && (key.startsWith('CONTEXTUAL_') || ['VOYAGE_API_KEY', 'FIRECRAWL_API_KEY'].includes(key))) env[key] = value;
+  // This file is often committed. Credentials and endpoint URLs (which may
+  // contain passwords) must come from the MCP host's environment, never JSON.
+  const safeSettings = [
+    'CONTEXTUAL_EMBED_PROVIDER', 'CONTEXTUAL_EMBED_MODEL', 'CONTEXTUAL_RERANK', 'CONTEXTUAL_RERANK_MODEL',
+    'CONTEXTUAL_SEARCH_TIMEOUT_MS', 'CONTEXTUAL_GREP_TIMEOUT_MS', 'CONTEXTUAL_MAX_DISTANCE',
+    'CONTEXTUAL_MAX_RESOURCE_BLOB_BYTES', 'CONTEXTUAL_RESOURCE_PAGE',
+    'CONTEXTUAL_VOYAGE_TIMEOUT_MS', 'CONTEXTUAL_VOYAGE_MAX_ATTEMPTS', 'CONTEXTUAL_VOYAGE_RETRY_MAX_MS',
+    'CONTEXTUAL_OLLAMA_TIMEOUT_MS',
+  ];
+  for (const key of safeSettings) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
   }
-  env.CONTEXTUAL_DATABASE_URL = process.env.CONTEXTUAL_DATABASE_URL ?? DEFAULT_URL;
   env.CONTEXTUAL_BLOB_DIR = resolve(process.env.CONTEXTUAL_BLOB_DIR ?? 'blobs');
   return { command: process.execPath, args: bundled ? ['serve'] : ['run', fileURLToPath(new URL('./contextual.ts', import.meta.url)), 'serve'], env };
 }
@@ -134,11 +160,12 @@ export async function initConfig(output: string, force = false): Promise<{ path:
   }
   const server = hostConfig();
   const existing = config.mcpServers?.contextual;
-  if (existing && JSON.stringify(existing) !== JSON.stringify(server) && !force) {
+  const unchanged = isDeepStrictEqual(existing, server);
+  if (existing && !unchanged && !force) {
     throw new Error('init: contextual is already configured differently. Use --force to replace only that entry, or --output for a separate file.');
   }
   await mkdir(server.env.CONTEXTUAL_BLOB_DIR!, { recursive: true });
-  if (existing && JSON.stringify(existing) === JSON.stringify(server)) return { path, written: false };
+  if (unchanged) return { path, written: false };
   config.mcpServers = { ...config.mcpServers, contextual: server };
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${randomUUID()}.tmp`;
@@ -192,12 +219,19 @@ export async function checkMcp(server = hostConfig()): Promise<Check> {
             send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'cx_ls', arguments: { path: '/' } } });
             await proc.stdin.flush();
           }
-          if (message.id === 1) discovered = message.result?.tools?.length === 6;
-          if (message.id === 2) catalog = message.result?.content?.some((item: { type: string }) => item.type === 'text') === true;
+          if (message.id === 1) {
+            const names = new Set(message.result?.tools?.map((tool: { name: string }) => tool.name));
+            if (!['cx_ls', 'cx_glob', 'cx_grep', 'cx_read', 'cx_search', 'cx_skill'].every((name) => names.has(name))) throw new Error('Required tools are missing');
+            discovered = true;
+          }
+          if (message.id === 2) {
+            catalog = message.result?.content?.some((item: { type: string }) => item.type === 'text') === true;
+            if (!catalog) throw new Error('Catalog response is missing');
+          }
         }
       }
     } finally { reader.releaseLock(); proc.kill(); await proc.exited; await logs; }
-    return { name: 'mcp', status: 'ok', message: 'Generated configuration starts the server, discovers six tools, and reads the catalog.' };
+    return { name: 'mcp', status: 'ok', message: 'Generated configuration starts the server, discovers the required tools, and reads the catalog.' };
   } catch {
     return { name: 'mcp', status: 'error', message: 'The generated MCP configuration did not complete a stdio round trip.', suggested_action: 'Check the executable and server paths, runtime dependencies, and server logs, then rerun contextual init.' };
   } finally {
@@ -220,6 +254,8 @@ export async function runSetup(args: string[]): Promise<void> {
   const output = command === 'init' ? await initConfig(values.output ?? '.mcp.json', values.force) : undefined;
   const report = await doctor();
   if (output) {
+    report.checks.push({ name: 'host_environment', status: 'warning', message: 'Credentials and endpoint URLs are inherited, not saved in the configuration.',
+      suggested_action: 'Configure CONTEXTUAL_DATABASE_URL, CONTEXTUAL_OLLAMA_URL and API keys as needed through your MCP host\'s environment or secret settings. The startup check uses this shell\'s environment.' });
     report.checks.push(report.ok ? await checkMcp() : { name: 'mcp', status: 'warning', message: 'Server startup check skipped until the diagnostic errors above are resolved.' });
     report.ok = !report.checks.some((check) => check.status === 'error');
   }

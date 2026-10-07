@@ -40,17 +40,31 @@ export interface GrepOptions {
   pathGlob?: string;
   ignoreCase?: boolean;
   maxMatches?: number;
-  offset?: number;
+  after?: GrepPosition;
   /** Overrides the statement timeout, in milliseconds. */
   timeoutMs?: number;
 }
 
+export interface GrepPosition { nodeId: number; line: number }
+export interface GrepPage {
+  matches: (GrepMatch & { nodeId: number })[];
+  next: GrepPosition | null;
+  scannedFiles: number;
+}
+export const MAX_GREP_FILES = 200;
+const FILE_COMPLETE = Number.MAX_SAFE_INTEGER;
 const MAX_LINE_CHARS = 300;
 export const DEFAULT_TIMEOUT_MS = envNumber('CONTEXTUAL_GREP_TIMEOUT_MS');
 
 export class GrepTooExpensiveError extends Error {}
 
 export async function grep(pattern: string, opts: GrepOptions = {}): Promise<GrepMatch[]> {
+  return (await grepPage(pattern, opts)).matches.map(({ nodeId: _, ...match }) => match);
+}
+
+/** Keyset pagination bounds line splitting to 200 files, even for broad regexes.
+ * Continue by node id and line, without rescanning all previously matched files. */
+export async function grepPage(pattern: string, opts: GrepOptions = {}): Promise<GrepPage> {
   const { ignoreCase = true, maxMatches = 60 } = opts;
   if (!pattern) throw new InputError('invalid regular expression: empty pattern');
 
@@ -68,13 +82,15 @@ export async function grep(pattern: string, opts: GrepOptions = {}): Promise<Gre
       const fileMatch = ignoreCase ? sql`n.content ~* ${re}` : sql`n.content ~ ${re}`;
       const lineMatch = ignoreCase ? sql`l.line ~* ${re}` : sql`l.line ~ ${re}`;
 
-      return (await sql`
+      const [page] = await sql`
         WITH candidates AS (
-          SELECT n.uri, n.content,
+          SELECT n.id, n.uri, n.content,
             '/' || CASE WHEN s.kind='skill' THEN 'skills/' || s.name ELSE 'docs/' || coalesce(s.collection,'default') END
                 || '/' || n.path AS path
           FROM nodes n JOIN sources s ON s.id = n.source_id
           WHERE n.content IS NOT NULL
+            AND (n.id > ${opts.after?.nodeId ?? 0}
+                 OR (n.id = ${opts.after?.nodeId ?? 0} AND ${opts.after?.line ?? 0} < ${FILE_COMPLETE}))
             AND (${parts === null} OR (
               (${parts?.kind == null} OR s.kind = ${parts?.kind ?? null})
               AND (${parts?.root == null} OR s.name = ${parts?.root ?? null}
@@ -83,19 +99,37 @@ export async function grep(pattern: string, opts: GrepOptions = {}): Promise<Gre
             ))
             AND ${fileMatch}
         ),
-        scoped AS (
+        candidate_window AS MATERIALIZED (
           -- The precise single-star versus double-star distinction, applied
           -- to the full VFS path that the agent actually sees.
           SELECT * FROM candidates
           WHERE ${parts === null} OR path ~ ${parts?.regexSource ?? ''}
+          ORDER BY id
+          LIMIT ${MAX_GREP_FILES + 1}
+        ),
+        scoped AS MATERIALIZED (
+          SELECT * FROM candidate_window ORDER BY id LIMIT ${MAX_GREP_FILES}
+        ),
+        matches AS MATERIALIZED (
+          SELECT c.id AS "nodeId", c.uri, c.path, l.ord::int AS line, left(btrim(l.line), ${MAX_LINE_CHARS}) AS text
+          FROM scoped c
+          CROSS JOIN LATERAL regexp_split_to_table(c.content, E'\\n') WITH ORDINALITY AS l(line, ord)
+          WHERE ${lineMatch} AND (c.id <> ${opts.after?.nodeId ?? 0} OR l.ord > ${opts.after?.line ?? 0})
+          ORDER BY c.id, l.ord
+          LIMIT ${maxMatches + 1}
         )
-        SELECT c.uri, c.path, l.ord::int AS line, left(btrim(l.line), ${MAX_LINE_CHARS}) AS text
-        FROM scoped c
-        CROSS JOIN LATERAL regexp_split_to_table(c.content, E'\\n') WITH ORDINALITY AS l(line, ord)
-        WHERE ${lineMatch}
-        ORDER BY c.path COLLATE "C", c.uri COLLATE "C", l.ord
-        LIMIT ${maxMatches} OFFSET ${opts.offset ?? 0}
-      `) as unknown as GrepMatch[];
+        SELECT coalesce(jsonb_agg(matches ORDER BY "nodeId", line), '[]'::jsonb) AS matches,
+          (SELECT count(*)::int FROM scoped) AS "scannedFiles",
+          (SELECT max(id) FROM scoped) AS "lastNodeId",
+          (SELECT count(*) > ${MAX_GREP_FILES} FROM candidate_window) AS "hasMoreFiles"
+        FROM matches
+      ` as { matches: GrepPage['matches']; scannedFiles: number; lastNodeId: number; hasMoreFiles: boolean }[];
+      const matches = page!.matches.slice(0, maxMatches);
+      const last = matches.at(-1);
+      const next = page!.matches.length > maxMatches && last
+        ? { nodeId: last.nodeId, line: last.line }
+        : page!.hasMoreFiles ? { nodeId: page!.lastNodeId, line: FILE_COMPLETE } : null;
+      return { matches, next, scannedFiles: page!.scannedFiles };
     });
   } catch (err) {
     if (isTimeout(err)) {

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } fr
 import { tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { compatibleRuntime, MIN_BUN_VERSION } from '../src/cli/setup';
+import { compatibleRuntime, MIN_BUN_VERSION, checkMcp } from '../src/cli/setup';
 
 const cli = fileURLToPath(new URL('../src/cli/contextual.ts', import.meta.url));
 async function run(args: string[], cwd: string, extra: Record<string, string> = {}) {
@@ -62,6 +62,53 @@ describe('first-run setup', () => {
     expect(await readdir(join(dir, 'local blobs'))).toEqual([]);
     const again = await run(['init', '--json'], dir);
     expect(JSON.parse(again.stdout).config.written).toBe(false);
+    // JSON object ordering is not configuration drift, including nested env.
+    const entry = config.mcpServers.contextual;
+    config.mcpServers.contextual = { env: Object.fromEntries(Object.entries(entry.env).reverse()), args: entry.args, command: entry.command };
+    const reordered = JSON.stringify(config, null, 4);
+    await writeFile(output, reordered);
+    const same = await run(['init', '--json'], dir);
+    expect(JSON.parse(same.stdout).config.written).toBe(false);
+    expect(await readFile(output, 'utf8')).toBe(reordered);
+  }));
+
+  test('init --force never serializes shell or autoloaded dotenv credentials', () => temporary(async (dir) => {
+    const output = join(dir, '.mcp.json');
+    await writeFile(output, JSON.stringify({ mcpServers: { contextual: { command: 'old' } } }));
+    await writeFile(join(dir, '.env'), 'CONTEXTUAL_HTTP_TOKEN=dotenv-token\nFIRECRAWL_API_KEY=dotenv-firecrawl\nCONTEXTUAL_FUTURE_SECRET=dotenv-secret\n');
+    const response = await run(['init', '--force', '--json'], dir, {
+      VOYAGE_API_KEY: 'shell-voyage', CONTEXTUAL_VOYAGE_API_KEY: 'alias-voyage',
+      CONTEXTUAL_OLLAMA_URL: 'https://user:url-password@example.test',
+      CONTEXTUAL_SEARCH_TIMEOUT_MS: '12345',
+    });
+    const raw = await readFile(output, 'utf8');
+    for (const secret of ['private-password', 'dotenv-token', 'dotenv-firecrawl', 'dotenv-secret', 'shell-voyage', 'alias-voyage', 'url-password']) {
+      expect(raw + response.stdout + response.stderr).not.toContain(secret);
+    }
+    const env = JSON.parse(raw).mcpServers.contextual.env;
+    expect(env.CONTEXTUAL_DATABASE_URL).toBeUndefined();
+    expect(env.CONTEXTUAL_HTTP_TOKEN).toBeUndefined();
+    expect(env.CONTEXTUAL_SEARCH_TIMEOUT_MS).toBe('12345');
+    expect(JSON.parse(response.stdout).checks.find((c: any) => c.name === 'host_environment').message).toContain('inherited');
+  }));
+
+  test('MCP startup accepts extra tools and fails promptly when required tools are missing', () => temporary(async (dir) => {
+    const stub = join(dir, 'server.ts');
+    await writeFile(stub, `import { createInterface } from 'node:readline';
+const names = JSON.parse(process.env.TOOL_NAMES!);
+for await (const line of createInterface({ input: process.stdin })) {
+  const message = JSON.parse(line);
+  if (message.id === undefined) continue;
+  const result = message.id === 1 ? { tools: names.map((name: string) => ({ name })) }
+    : message.id === 2 ? { content: [{ type: 'text', text: 'catalog' }] } : {};
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\\n');
+}`);
+    const required = ['cx_ls', 'cx_glob', 'cx_grep', 'cx_read', 'cx_search', 'cx_skill'];
+    const check = (names: string[]) => checkMcp({ command: process.execPath, args: [stub], env: { TOOL_NAMES: JSON.stringify(names) } });
+    expect((await check([...required, 'cx_future'])).status).toBe('ok');
+    const start = Date.now();
+    expect((await check(required.slice(0, -1))).status).toBe('error');
+    expect(Date.now() - start).toBeLessThan(3000);
   }));
 
   test('conflicting entries require --force; malformed files and symlinks are preserved', () => temporary(async (dir) => {

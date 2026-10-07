@@ -139,12 +139,17 @@ is supported and passes. Blob checks create and remove a temporary probe file.
 `init` defaults to `.mcp.json` in the current directory. It merges only
 `mcpServers.contextual`, leaves unrelated settings intact, and creates the blob
 directory. Source launches use absolute Bun and CLI paths; standalone launches
-use the executable itself with `serve`. Configuration captures the current
-`CONTEXTUAL_*` settings and configured Voyage/Firecrawl keys, including database
-credentials. It is written atomically with owner-only permissions; keep the
-generated file private and out of version control if it contains secrets.
+use the executable itself with `serve`. Configuration saves the absolute blob
+path and an allowlist of nonsecret stdio settings (provider/model selections,
+reranking flags, retrieval limits and timeouts). It never copies credentials,
+HTTP tokens, arbitrary `CONTEXTUAL_*` variables, or endpoint URLs into JSON,
+including values Bun loaded from `.env`. It is written atomically with owner-only
+permissions. Supply `CONTEXTUAL_DATABASE_URL`, `CONTEXTUAL_OLLAMA_URL` and API keys,
+as needed, through your MCP host's environment or secret settings. A host launched
+outside your shell may need these configured separately; `init` reports this
+requirement and its startup check inherits the current shell's environment.
 
-An identical existing entry is left alone. A different contextual entry requires
+An equivalent existing entry is left alone, regardless of JSON key order. A different contextual entry requires
 `--force`; malformed JSON and symlinks are not overwritten. `init --json` prints
 the config path, whether it was written, and diagnostics without printing secrets.
 After the checks pass, init starts a temporary stdio server using the generated
@@ -713,13 +718,24 @@ positions. Directory pages return `returned` and `next_offset`, counting only
 entries actually shown. Glob and grep limits are per page. Search's `limit` is
 the size of the selected ranked result set; a cursor pages that set when it
 exceeds the output budget. `cx_skill` cursors continue its instructions/manifest.
+Document text containing the envelope's closing delimiter is cut at that point,
+with `content_suppressed: true` and a safety notice. Offsets and continuations
+cannot bypass that boundary; only ordinary, unsuppressed text pages are lossless.
 The root catalog remains a compact summary; browse `/skills` or `/docs` for
 complete listings. Binary assets retain the size ceilings above and do not page.
 
-Cursors are bound to the request. Text and ranked-result cursors also detect
-changed content and return `STALE_CURSOR`; restart without a cursor. Directory,
-glob and grep pages are live offset-based views, so restart enumeration if the
-corpus changes during traversal. Cursors are continuation hints, not snapshots.
+Cursors are bound to the request. Text cursors detect changed content and return
+`STALE_CURSOR`; restart without a cursor. Search cursors reuse ranked results and
+their diagnostics, without new SQL, embedding or reranking calls. These snapshots
+expire after five minutes and share a process-local LRU cache (128 snapshots,
+8 MiB). Eviction, expiry or a server restart returns `EXPIRED_CURSOR`; restart
+the search without a cursor. HTTP requests must reach the same server process.
+
+Directory and glob pages are live offset-based views. Grep uses file-ID/line
+keysets, splitting at most 200 candidate files per call; `scanned_files` reports
+that count. A page can contain no matching lines and still have a continuation
+when a file-level regex spans lines. Follow `next_cursor` until it is null.
+Restart enumeration if the corpus changes during traversal.
 
 ### Search diagnostics
 
@@ -738,7 +754,7 @@ in readable text for clients that do not expose structured content.
 
 Tool execution errors set `isError: true` and return `structuredContent.error`
 with the same recovery fields. Codes include `INVALID_ARGUMENT`, `INVALID_CURSOR`,
-`STALE_CURSOR`, `NOT_FOUND`, `ASSET_MISSING`, `QUERY_TIMEOUT`,
+`STALE_CURSOR`, `EXPIRED_CURSOR`, `NOT_FOUND`, `ASSET_MISSING`, `QUERY_TIMEOUT`,
 `MIGRATIONS_REQUIRED`, and `SERVICE_ERROR`. Narrow expensive queries, fix invalid
 arguments, or run `contextual doctor` as suggested instead of repeating the
 same failed call. MCP schema-validation errors still use the protocol's invalid

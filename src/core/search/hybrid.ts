@@ -134,18 +134,9 @@ export async function searchWithDiagnostics(queries: string[], opts: SearchOptio
   );
 
   const candidates = rrf(lists).slice(0, Math.max(30, limit));
-  let preferred: number[] = [];
-  const rerankMissingKey = process.env.CONTEXTUAL_RERANK === 'true' && !(process.env.VOYAGE_API_KEY ?? process.env.CONTEXTUAL_VOYAGE_API_KEY);
-  if (rerankMissingKey) {
-    warnings.push({ code: 'RERANK_UNAVAILABLE', message: 'Reranking is enabled but no Voyage key is configured; using the original ranking.', retryable: false,
-      suggested_action: 'Configure the reranker credentials or set CONTEXTUAL_RERANK=false.' });
-  } else try {
-    const order = await rerank(qs.join('\n'), candidates.map((c) => [c.item.sourceName, ...c.item.headingPath, c.item.content].join('\n')));
-    preferred = order?.map((i) => candidates[i]!.item.chunkId) ?? [];
-  } catch (err) {
-    warnings.push({ code: 'RERANK_UNAVAILABLE', message: 'Reranking failed; using the original retrieval ranking.', retryable: err instanceof EmbeddingError && err.failure === 'transient',
-      suggested_action: 'Retry later, or check the reranker configuration and credentials.' });
-  }
+  const reranked = await rerank(qs.join('\n'), candidates.map((c) => [c.item.sourceName, ...c.item.headingPath, c.item.content].join('\n')));
+  const preferred = reranked.order?.map((i) => candidates[i]!.item.chunkId) ?? [];
+  if (reranked.warning) warnings.push(reranked.warning);
   return { hits: diversify(lists, qs.length, limit, 3, preferred), retrieval_mode: vectors.some((v) => v !== null) ? 'hybrid' : 'full_text', warnings };
 
 }

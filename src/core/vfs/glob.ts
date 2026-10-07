@@ -120,7 +120,7 @@ export async function glob(pattern: string, limit = 200, offset = 0): Promise<Gl
   const { kind, root, prefix, regexSource } = decomposeGlob(pattern);
 
   const rows = (await db()`
-    SELECT
+    SELECT * FROM (SELECT
       '/' || CASE WHEN s.kind='skill' THEN 'skills/' || s.name ELSE 'docs/' || coalesce(s.collection,'default') END
           || '/' || n.path AS path,
       n.uri, n.role, n.size_bytes AS "sizeBytes"
@@ -129,7 +129,8 @@ export async function glob(pattern: string, limit = 200, offset = 0): Promise<Gl
       AND (${root === null} OR s.name = ${root} OR coalesce(s.collection,'default') = ${root})
       AND (${prefix === ''} OR n.path LIKE ${`${escapeLike(prefix)}%`})
     AND ('/' || CASE WHEN s.kind='skill' THEN 'skills/' || s.name ELSE 'docs/' || coalesce(s.collection,'default') END || '/' || n.path) ~ ${regexSource}
-    ORDER BY path COLLATE "C", n.uri COLLATE "C"
+    ) AS matches
+    ORDER BY matches.path COLLATE "C", matches.uri COLLATE "C"
     LIMIT ${limit} OFFSET ${offset}
   `) as unknown as GlobHit[];
 

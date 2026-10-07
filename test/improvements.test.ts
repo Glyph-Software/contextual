@@ -13,9 +13,19 @@ import { envelope } from '../src/mcp/format';
 import { diversify, type Hit } from '../src/core/search/hybrid';
 import { retryAfterMs, voyageRequest } from '../src/core/ingest/voyage';
 import { envNumber } from '../src/core/config';
+import { sqlState, UNDEFINED_TABLE, UNDEFINED_COLUMN } from '../src/core/db';
 
 const dir = await mkdtemp(join(tmpdir(), 'contextual-regressions-'));
 afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
+
+test('SQLSTATE normalization handles both Bun error fields and numeric codes', () => {
+  expect(sqlState({ errno: UNDEFINED_TABLE, code: 'ERR_POSTGRES_SERVER_ERROR' })).toBe(UNDEFINED_TABLE);
+  expect(sqlState({ errno: 42703 })).toBe(UNDEFINED_COLUMN);
+  expect(sqlState({ code: UNDEFINED_TABLE })).toBe(UNDEFINED_TABLE);
+  expect(sqlState({ errno: 'invalid', code: 42703 })).toBe(UNDEFINED_COLUMN);
+  expect(sqlState({ code: 'ERR_POSTGRES_SERVER_ERROR' })).toBeUndefined();
+  expect(sqlState(null)).toBeUndefined();
+});
 
 describe('safe text and path handling', () => {
   test('binary and invalid UTF-8 cannot fall through to text, even with a text extension', async () => {
