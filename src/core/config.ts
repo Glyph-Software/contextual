@@ -38,6 +38,10 @@ export function embedProvider(): 'voyage' | 'ollama' | 'none' {
   }
   return provider;
 }
+/** Keep the public key and its legacy alias consistent across all consumers. */
+export function voyageKey(): string | undefined {
+  return process.env.VOYAGE_API_KEY ?? process.env.CONTEXTUAL_VOYAGE_API_KEY;
+}
 export function envNumber(name: keyof typeof NUMERIC_SETTINGS): number {
   const [fallback, min, max, integer] = NUMERIC_SETTINGS[name];
   const raw = process.env[name];

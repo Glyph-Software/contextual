@@ -65,8 +65,24 @@ bun run src/cli/contextual.ts add ./report.pdf --collection handbook
 bun run src/cli/contextual.ts list
 ```
 
-Register it with Claude Code by copying `.mcp.json` into your project and
-replacing `/absolute/path/to/contextual` with this checkout's real path. MCP
+Generate a host configuration and check the installation:
+
+```bash
+bun run src/cli/contextual.ts doctor
+bun run src/cli/contextual.ts init --output /path/to/your/project/.mcp.json
+```
+
+`init` merges the contextual entry with absolute executable and storage paths,
+creates blob storage, and verifies a real MCP discovery/catalog round trip.
+It saves only an allowlist of nonsecret stdio settings; configure credentials and
+database/provider URLs through your MCP host's environment or secret settings.
+Existing unrelated entries are preserved; replacing a different contextual
+entry requires `--force`. `doctor --json` provides machine-readable checks for
+the runtime, configuration, database, migrations, storage and embedding provider.
+See [setup diagnostics](USAGE.md#setup-diagnostics-and-generated-configuration)
+for exit codes and configuration handling.
+
+Register the generated file with your MCP host. MCP
 hosts spawn `args` as literal argv, so shell syntax such as `${VAR:-default}` is
 not expanded and would be passed through verbatim. Then ask a question the corpus
 answers. The agent should reach it on its own via `cx_ls` → `cx_search` →
@@ -237,7 +253,14 @@ This is the product, not an optimization, so it is enforced in code:
   cannot exhaust the server.
 
 Every tool has a hard output cap (`BUDGET` in `src/mcp/format.ts`). Over-cap
-results truncate and return a pointer to read the rest — never a silent dump.
+results page with an opaque `next_cursor` and a complete continuation call
+outside the content body. Cursors preserve long lines and Unicode characters;
+directory offsets advance only past entries actually returned. Existing line
+offsets remain accepted by `cx_read`. `cx_skill`, `cx_glob`, and `cx_grep` also
+support cursors; search cursors continue the selected ranked result set.
+Search pages reuse a bounded, five-minute snapshot, so continuation does not
+repeat embedding or reranking requests. Safety-filtered document tails are
+explicitly marked as suppressed and cannot be retrieved through a continuation.
 
 ## Ingest
 
@@ -350,6 +373,18 @@ are capped at three per document. This can return fewer than the requested limit
 Document/collection names and full heading paths prefix the text indexed for
 FTS and embeddings without appearing in `cx_read` content.
 
+Use `cx_search({queries: ["process invoice payments"], target: "skills"})` to
+discover skills by purpose. This ranks indexed names and descriptions, returns
+metadata and a `cx_skill` load action, and does not read or chunk SKILL.md.
+The default `target: "passages"` preserves existing retrieval behavior.
+
+Search replies include `structuredContent.retrieval_mode` (`full_text`,
+`hybrid`, or `skill_metadata`) and structured `warnings` with stable codes,
+retryability and suggested actions. Disabled embeddings, model mismatch,
+provider/authentication failures and reranking failures are also explained in
+the readable response, including when there are no matches. Tool errors carry
+`structuredContent.error` with the same recovery fields.
+
 Optional reranking uses `rerank-2.5-lite` over the fused candidate set. Set
 `CONTEXTUAL_RERANK=true` with a Voyage key to enable it; this sends candidate
 passages to Voyage. On API failure the ordinary fused ranking is retained.
@@ -371,7 +406,11 @@ not the source-relative path stored in the database. `cx_glob` and `cx_grep`
 share one translation, so a pattern copied from one works in the other. Globs
 support `*`, `**`, `?`, braces, and character classes; malformed or nested brace
 patterns fail explicitly. Exact matching happens before SQL limits. Directory
-listings aggregate immediate children in SQL and expose an `offset` continuation.
+listings aggregate immediate children in SQL. Cursor pages advance past only
+the entries that fit the response; legacy `offset` calls are still accepted.
+Grep splits at most 200 candidate files per call and continues by file ID and
+line number. Pages can reach all matching files without rescanning completed
+files; the statement timeout still bounds regex matching and large-file work.
 
 ## Security
 
@@ -386,7 +425,11 @@ untrusted data. The service enforces these boundaries:
   URIs from addressing one node.
 - Retrieved **documents, search hits and grep hits** are framed as **data, not
   instructions**, in an `<contextual-content untrusted>` envelope. A body that
-  contains the envelope's closing tag is cut there and the cut is announced.
+  contains the envelope's closing delimiter has that delimiter and its tail
+  suppressed, with an explicit notice and `content_suppressed` metadata.
+  Document reads check this boundary before paging, so offsets and continuations
+  cannot reveal the suppressed tail. Ordinary text pages preserve their content;
+  safety-filtered responses are not lossless copies.
   Metadata is escaped too, including headings and filenames.
 - **Skills are instructions, and are returned bare.** The split is by *content
   kind*, not by which tool was called: `SKILL.md` is instructions whether it
@@ -409,7 +452,7 @@ untrusted data. The service enforces these boundaries:
 ## Layout
 
 ```
-db/migrations/             001–005: schema, retrieval context, URIs, notifications
+db/migrations/             001–006: schema, retrieval context, URIs, notifications, skill discovery
 fixtures/                  # sample documents and retrieval evaluation data
 scripts/                   # evaluation, binary smoke checks, fixture generation
 Dockerfile                 # compiled service + Tesseract + Poppler
@@ -420,10 +463,10 @@ src/
     tokens.ts               # BUDGET + estimateTokens (re-exported by mcp/format)
     ingest/  detect skill document local-ocr chunk embed pipeline
     vfs/     uri resolve list glob grep
-    search/  hybrid rrf
+    search/  hybrid rrf rerank skills diagnostics
     catalog/ index watch
-  mcp/       server http http-body uploads resources tools format
-  cli/       contextual.ts commands.ts
+  mcp/       server http http-body uploads resources tools format pagination
+  cli/       contextual.ts commands.ts setup.ts
 test/                       # bun test
 ```
 
@@ -481,13 +524,16 @@ contextual reindex [--all]      Embed chunks that have no vector yet
 contextual remove <kind> <name> Remove a source
 contextual migrate              Apply database migrations
 contextual serve                Run MCP over stdio (default) or Streamable HTTP
+contextual doctor [--json]       Diagnose runtime, database, storage and embeddings
+contextual init [--output file]  Generate MCP config and verify a client round trip
 ```
 
 | Flag | Meaning |
 |---|---|
 | `--collection <name>` | Collection for ingested documents |
 | `--lenient` | Warn and ignore unknown skill metadata fields |
-| `--force` | Re-ingest even when the content hash is unchanged |
+| `--force` | Re-ingest unchanged content; for `init`, replace only the contextual config entry |
+| `--output <file>` | `init`: MCP configuration file (default `.mcp.json`) |
 | `--all` | `reindex`: re-embed everything and re-pin the model |
 | `--allow-reserved` | Permit `claude`/`anthropic` in a skill name |
 | `--json` | Machine-readable output |

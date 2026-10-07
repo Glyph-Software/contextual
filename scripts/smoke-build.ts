@@ -23,6 +23,12 @@ try {
   await admin.unsafe(`CREATE SCHEMA ${schema}`);
   await command(['--help']);
   await command(['migrate']);
+  const setup = JSON.parse(await command(['init', '--json']));
+  const generated = await Bun.file(join(directory, '.mcp.json')).json();
+  if (!setup.ok || !setup.checks.some((check: any) => check.name === 'mcp' && check.status === 'ok') ||
+      generated.mcpServers.contextual.command !== binary || JSON.stringify(generated.mcpServers.contextual.args) !== '["serve"]') {
+    throw new Error('compiled init did not generate a working standalone MCP configuration');
+  }
   const fixture = fileURLToPath(new URL('../fixtures/sample.docx', import.meta.url));
   const result = JSON.parse(await command(['add', fixture, '--json']));
   if (result[0]?.status !== 'ingested') throw new Error('compiled native addon did not ingest DOCX');
@@ -107,7 +113,7 @@ try {
     http.kill('SIGTERM');
     if (await http.exited) throw new Error(`compiled HTTP shutdown failed: ${await httpErrors}`);
   } finally { clearTimeout(httpTimeout); http.kill(); }
-  console.log(`Standalone smoke passed: embedded migrations, native DOCX ingest, ${hasOcr ? 'local PDF OCR, ' : ''}stdio reads, authenticated HTTP upload/read, clean EOF/SIGTERM shutdown.`);
+  console.log(`Standalone smoke passed: embedded migrations, generated MCP config and startup check, native DOCX ingest, ${hasOcr ? 'local PDF OCR, ' : ''}stdio reads, authenticated HTTP upload/read, clean EOF/SIGTERM shutdown.`);
 } finally {
   child?.kill();
   await admin.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);

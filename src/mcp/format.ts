@@ -11,6 +11,8 @@
  *    never a silent dump.
  */
 import type { CallToolResult, ContentBlock } from '@modelcontextprotocol/server';
+import { ENVELOPE_TAG, safeContentEnd, suppressUnsafeTail } from './content-safety';
+export { ENVELOPE_TAG } from './content-safety';
 
 export function log(...parts: unknown[]): void {
   const line = parts
@@ -61,9 +63,6 @@ export function cap(text: string, budgetTokens: number, hint?: string): Capped {
 /** Binary assets larger than this are described, not inlined, by `cx_read`. */
 export const MAX_INLINE_BLOB_BYTES = 3 * 1024 * 1024;
 
-export const ENVELOPE_TAG = 'contextual-content';
-const ENVELOPE_CLOSE = new RegExp(`</${ENVELOPE_TAG}\\b`, 'i');
-
 /**
  * Retrieved *documents* are data an agent is reasoning about, not instructions
  * it should follow, so document reads, search hits and grep hits are wrapped
@@ -72,18 +71,12 @@ const ENVELOPE_CLOSE = new RegExp(`</${ENVELOPE_TAG}\\b`, 'i');
  * two in one frame would make the model either ignore the skill or obey the
  * PDF.
  *
- * A body that contains the envelope's own closing tag could break out of the
- * frame, so it is cut there and the cut is announced — a truncated blob, never
- * nested markup.
+ * Suppress embedded closing delimiters and their tails. Paged reads apply the
+ * same check before slicing; a continuation cannot reveal the suppressed tail.
  */
 export function envelope(body: string, meta?: Record<string, unknown>): string {
-  const breakout = ENVELOPE_CLOSE.exec(body);
-  if (breakout) {
-    body =
-      body.slice(0, breakout.index) +
-      // The notice must not spell the tag out, or it would be the breakout.
-      `\n[truncated: the content contained the envelope's closing tag at this point and was cut for safety]`;
-  }
+  if (safeContentEnd(body) < body.length) meta = { ...meta, content_suppressed: true };
+  body = suppressUnsafeTail(body);
   const head = meta
     ? Object.entries(meta)
         .filter(([, v]) => v !== undefined && v !== null && v !== '')
@@ -110,10 +103,13 @@ export function resourceLink(uri: string, name: string, description?: string, mi
 
 export const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 
-export function result(blocks: ContentBlock[] | string): CallToolResult {
-  return { content: typeof blocks === 'string' ? [text(blocks)] : blocks };
+export function result(blocks: ContentBlock[] | string, metadata?: Record<string, unknown>): CallToolResult {
+  return { content: typeof blocks === 'string' ? [text(blocks)] : blocks, ...(metadata && { structuredContent: metadata }) };
 }
 
-export function errorResult(message: string): CallToolResult {
-  return { content: [text(message)], isError: true };
+export function errorResult(message: string, code = 'NOT_FOUND', suggestedAction = 'Use cx_ls to find the correct path or name.', retryable = false): CallToolResult {
+  return {
+    content: [text(`${message}\nNext: ${suggestedAction}`)], isError: true,
+    structuredContent: { error: { code, message, retryable, suggested_action: suggestedAction }, next_cursor: null },
+  };
 }

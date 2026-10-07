@@ -67,6 +67,17 @@ The document is readable at `ctx://docs/demo/quickstart.md`.
 
 ## 3. Connect an MCP client
 
+For generated configuration with diagnostics, use:
+
+```bash
+bun run src/cli/contextual.ts init --output /path/to/your/project/.mcp.json
+```
+
+This uses absolute executable and blob-storage paths and verifies that a client
+can discover the tools and read the catalog. If you are replacing the repository's
+placeholder contextual entry, add `--force`. Other server entries are preserved.
+See [setup diagnostics](#setup-diagnostics-and-generated-configuration) below.
+
 For a host that accepts an `mcpServers` configuration, add this entry to its MCP
 configuration. The repository's `.mcp.json` is a starting template for hosts
 that support project configuration files.
@@ -105,6 +116,49 @@ Try asking your agent:
 The expected answer from the sample is **every weekday at 09:00 UTC**. The
 agent can discover the collection with `cx_ls`, find the passage with
 `cx_search`, and follow its citation with `cx_read`.
+
+### Setup diagnostics and generated configuration
+
+```bash
+# Diagnose without applying migrations or changing your corpus
+bun run src/cli/contextual.ts doctor
+bun run src/cli/contextual.ts doctor --json
+
+# Merge a contextual entry into a host's mcpServers JSON
+bun run src/cli/contextual.ts init --output /path/to/project/.mcp.json
+```
+
+`doctor` checks the running Bun version against the package's minimum,
+environment settings, Postgres connectivity, required extensions, pending
+migrations, blob-storage access, and embedding configuration. A configured
+embedding provider receives one synthetic connectivity query, with a five-second
+request timeout and no retries; no corpus content is sent. The check validates
+vector dimensions and the corpus's pinned model. Full-text-only configuration
+is supported and passes. Blob checks create and remove a temporary probe file.
+
+`init` defaults to `.mcp.json` in the current directory. It merges only
+`mcpServers.contextual`, leaves unrelated settings intact, and creates the blob
+directory. Source launches use absolute Bun and CLI paths; standalone launches
+use the executable itself with `serve`. Configuration saves the absolute blob
+path and an allowlist of nonsecret stdio settings (provider/model selections,
+reranking flags, retrieval limits and timeouts). It never copies credentials,
+HTTP tokens, arbitrary `CONTEXTUAL_*` variables, or endpoint URLs into JSON,
+including values Bun loaded from `.env`. It is written atomically with owner-only
+permissions. Supply `CONTEXTUAL_DATABASE_URL`, `CONTEXTUAL_OLLAMA_URL` and API keys,
+as needed, through your MCP host's environment or secret settings. A host launched
+outside your shell may need these configured separately; `init` reports this
+requirement and its startup check inherits the current shell's environment.
+
+An equivalent existing entry is left alone, regardless of JSON key order. A different contextual entry requires
+`--force`; malformed JSON and symlinks are not overwritten. `init --json` prints
+the config path, whether it was written, and diagnostics without printing secrets.
+After the checks pass, init starts a temporary stdio server using the generated
+configuration, lists its tools, reads the catalog, and stops it.
+
+Both commands exit **0** when all required checks pass and **1** when errors
+remain. `init` still saves the configuration when diagnostics fail; fix the
+reported problems and rerun it. Neither command applies database migrations or
+ingests content. Run `contextual migrate` explicitly when requested by diagnostics.
 
 ## 4. Connect over Streamable HTTP
 
@@ -611,7 +665,7 @@ does not have `search` or `read` subcommands.
 | Tool | Use it for | Example arguments |
 |---|---|---|
 | `cx_ls` | Discover skills, collections, and files | `{"path":"/"}` or `{"path":"/docs/handbook","offset":0}` |
-| `cx_search` | Find ranked passages for one or more questions | `{"queries":["support queue review schedule"],"scope":"docs/demo","limit":8}` |
+| `cx_search` | Find ranked passages, or discover skills by purpose | `{"queries":["support queue review schedule"],"scope":"docs/demo","limit":8}` or `{"queries":["process invoices"],"target":"skills"}` |
 | `cx_read` | Open a file or a search result's chunk URI | `{"uri":"ctx://docs/demo/quickstart.md","offset":0,"limit":100}` |
 | `cx_skill` | Load a skill's instructions and file manifest | `{"name":"support-guide"}` |
 | `cx_glob` | Find files by path pattern | `{"pattern":"/skills/*/references/**","limit":100}` |
@@ -619,20 +673,92 @@ does not have `search` or `read` subcommands.
 
 Start at `cx_ls`, search for the needed information, then read relevant hits.
 For a skill, call `cx_skill` and read only the bundle files needed for the task.
+To discover a skill without knowing its name, call `cx_search` with
+`target: "skills"`. Results contain names, descriptions, URIs and a `cx_skill`
+load action, without instructions. Discovery supports `scope: "skills/{name}"`
+but rejects document scopes. The default target is `passages`, including when
+the scope is `skills`: that continues to search skill reference passages.
 
 - Search accepts **1–8 queries** together, with a result limit of **1–25**.
   Omit `scope` to search everything, or use `docs`, `skills`, or
   `docs/{collection}` to narrow it.
 - A `#chunk=N` URI returned by search opens the passage with its neighbors.
   Preserve the returned citation instead of inventing chunk IDs.
-- File-read offsets are **zero-based line offsets**. Follow the continuation
-  offset when a response is truncated. Explicit line limits can be up to 5000,
-  but output-size caps still apply.
+- File-read offsets are **zero-based line offsets**. For continuation, prefer
+  the opaque `next_cursor` returned in `structuredContent`. Explicit line limits
+  can be up to 5000; a continuation is returned whenever more content remains,
+  including when the requested line limit is below the output-size cap.
 - Glob patterns match virtual paths, not local disk paths. Grep uses PostgreSQL
   regular expressions, so not every JavaScript regex feature is supported.
 - Binary assets can be returned inline by `cx_read` up to 3 MiB. Larger assets
   may be accessible through host resource reads, whose default ceiling is
   12 MiB.
+
+### Continuation and recovery
+
+All six tools return structured metadata with `next_cursor` (a string or `null`).
+To continue, repeat the original tool call with `cursor` set to that string.
+Keep filters, queries and limits unchanged; omit an initial line/entry `offset`
+when switching to a cursor. A complete suggested call is also appended outside
+the content frame, so it cannot be lost when the result body is shortened.
+
+```json
+{"uri":"ctx://docs/demo/quickstart.md","limit":100}
+```
+
+When `structuredContent.next_cursor` is non-null, the next call is:
+
+```json
+{"uri":"ctx://docs/demo/quickstart.md","limit":100,"cursor":"<returned next_cursor>"}
+```
+
+Read cursors can continue within a long line without splitting Unicode surrogate
+pairs. Text metadata includes `start_character` and `end_character` as UTF-16
+positions. Directory pages return `returned` and `next_offset`, counting only
+entries actually shown. Glob and grep limits are per page. Search's `limit` is
+the size of the selected ranked result set; a cursor pages that set when it
+exceeds the output budget. `cx_skill` cursors continue its instructions/manifest.
+Document text containing the envelope's closing delimiter is cut at that point,
+with `content_suppressed: true` and a safety notice. Offsets and continuations
+cannot bypass that boundary; only ordinary, unsuppressed text pages are lossless.
+The root catalog remains a compact summary; browse `/skills` or `/docs` for
+complete listings. Binary assets retain the size ceilings above and do not page.
+
+Cursors are bound to the request. Text cursors detect changed content and return
+`STALE_CURSOR`; restart without a cursor. Search cursors reuse ranked results and
+their diagnostics, without new SQL, embedding or reranking calls. These snapshots
+expire after five minutes and share a process-local LRU cache (128 snapshots,
+8 MiB). Eviction, expiry or a server restart returns `EXPIRED_CURSOR`; restart
+the search without a cursor. HTTP requests must reach the same server process.
+
+Directory and glob pages are live offset-based views. Grep uses file-ID/line
+keysets, splitting at most 200 candidate files per call; `scanned_files` reports
+that count. A page can contain no matching lines and still have a continuation
+when a file-level regex spans lines. Follow `next_cursor` until it is null.
+Restart enumeration if the corpus changes during traversal.
+
+### Search diagnostics
+
+`cx_search` returns `retrieval_mode: "full_text"`, `"hybrid"` or
+`"skill_metadata"` alongside `warnings`, even when there are no results. Hybrid
+means query vectors were available for the combined retrieval query; individual
+hits can still come from full text alone. Skill discovery ranks indexed metadata
+using full-text search and does not require embeddings.
+
+Each warning has `code`, `message`, `retryable`, and `suggested_action`. Codes
+include `EMBEDDINGS_DISABLED`, `EMBEDDING_MODEL_MISMATCH`,
+`EMBEDDING_UNAVAILABLE`, `EMBEDDING_AUTH_FAILED`, and `RERANK_UNAVAILABLE`.
+Provider failures retain full-text retrieval and do not turn an empty result
+into evidence that semantic search found nothing. These diagnostics also appear
+in readable text for clients that do not expose structured content.
+
+Tool execution errors set `isError: true` and return `structuredContent.error`
+with the same recovery fields. Codes include `INVALID_ARGUMENT`, `INVALID_CURSOR`,
+`STALE_CURSOR`, `EXPIRED_CURSOR`, `NOT_FOUND`, `ASSET_MISSING`, `QUERY_TIMEOUT`,
+`MIGRATIONS_REQUIRED`, and `SERVICE_ERROR`. Narrow expensive queries, fix invalid
+arguments, or run `contextual doctor` as suggested instead of repeating the
+same failed call. MCP schema-validation errors still use the protocol's invalid
+parameters response.
 
 The host can also expose `ctx://index` and file URIs as MCP resources for manual
 selection. The tools are the agent's way to retrieve content during a task.
@@ -893,6 +1019,10 @@ embedding migration clears old vectors; run `reindex` with a key afterward.
 To apply parser or chunk-splitting improvements to previously stored documents,
 rerun their `add` commands with `--force`. Reindexing alone does not reconvert
 original documents. Restart the MCP server to load updated code.
+
+Migration `006_skill_discovery.sql` automatically indexes the names and
+descriptions of existing skills. Run migrations and restart the MCP server to
+enable `cx_search` with `target: "skills"`; existing bundles do not need re-ingestion.
 
 ## Configuration reference
 

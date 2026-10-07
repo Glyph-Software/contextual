@@ -58,11 +58,12 @@ export function pgArray(values: readonly string[] | null | undefined): string | 
  * a corpus that silently mixes two vector spaces or two stemmers.
  */
 /** Postgres `undefined_table`. Anything else is a real failure. */
-const UNDEFINED_TABLE = '42P01';
+export const UNDEFINED_TABLE = '42P01';
+export const UNDEFINED_COLUMN = '42703';
 /** Postgres `query_canceled`, which is what a statement timeout raises. */
 export const QUERY_CANCELED = '57014';
 
-const sqlState = (err: unknown): string | undefined => {
+export const sqlState = (err: unknown): string | undefined => {
   const e = err as { errno?: unknown; code?: unknown };
   for (const v of [e?.errno, e?.code]) if (typeof v === 'string' || typeof v === 'number') {
     const s = String(v);
