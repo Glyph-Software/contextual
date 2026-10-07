@@ -1,8 +1,12 @@
 #!/usr/bin/env bun
 import { validateConfig, databaseHint } from '../core/config';
 try {
-  validateConfig();
-  await import('./commands');
+  if (['doctor', 'init'].includes(Bun.argv[2] ?? '')) {
+    await (await import('./setup')).runSetup(Bun.argv.slice(2));
+  } else {
+    validateConfig();
+    await import('./commands');
+  }
 } catch (err) {
   const message = (err as Error).message;
   console.error(`✗ ${message}`);

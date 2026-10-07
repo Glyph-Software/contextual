@@ -11,9 +11,11 @@ import { envNumber } from '../config';
  * spends one round trip on a multi-part question.
  */
 import { db, toVector, ftsConfig, getSetting, withStatementTimeout, isTimeout } from '../db';
-import { getEmbedder } from '../ingest/embed';
+import { getEmbedder, EmbeddingError, type Embedder } from '../ingest/embed';
 import { rerank } from './rerank';
 import { rrf, type Ranked } from './rrf';
+import { InputError } from '../errors';
+import type { RetrievalDiagnostics, RetrievalWarning } from './diagnostics';
 
 export interface Hit {
   chunkId: number;
@@ -66,25 +68,46 @@ export interface SearchOptions {
 export const DEFAULT_MAX_DISTANCE = envNumber('CONTEXTUAL_MAX_DISTANCE');
 
 export async function search(queries: string[], opts: SearchOptions = {}): Promise<Hit[]> {
+  return (await searchWithDiagnostics(queries, opts)).hits;
+}
+
+export async function searchWithDiagnostics(queries: string[], opts: SearchOptions = {}): Promise<{ hits: Hit[] } & RetrievalDiagnostics> {
   const { limit = 10, perQuery = 30 } = opts;
   const qs = queries.map((q) => q.trim()).filter(Boolean);
-  if (qs.length === 0) return [];
+  if (qs.length === 0) throw new InputError('Provide at least one non-empty query.');
+  const warnings: RetrievalWarning[] = [];
 
   // An invalid scope is an error, not an unscoped search: an agent that asked
   // for "handbook" and silently got the whole corpus would cite the wrong thing.
   const scope = parseScope(opts.scope);
 
-  const embedder = getEmbedder();
+  let embedder: Embedder | null = null;
+  try { embedder = getEmbedder(); }
+  catch {
+    warnings.push({ code: 'EMBEDDING_UNAVAILABLE', message: 'The embedding provider configuration is invalid; searching full text only.', retryable: false,
+      suggested_action: 'Run contextual doctor and correct the embedding provider URL or model.' });
+  }
   // No embedder configured is a supported mode, not an error: the FTS half of
   // the hybrid still works and skills need no embeddings at all. The same goes
   // for an embedder that does not match the model the corpus was built with —
   // its vectors live in a different space, so comparing them would be noise.
   let vectors: (string | null)[] = qs.map(() => null);
-  if (embedder && (await embedderMatchesCorpus(embedder.id))) {
+  if (!embedder) {
+    if (!warnings.length) warnings.push({ code: 'EMBEDDINGS_DISABLED', message: 'Semantic retrieval is not configured; searching full text only.', retryable: false,
+      suggested_action: 'Use words from the documents, or configure an embedding provider and run contextual reindex.' });
+  } else if (!(await embedderMatchesCorpus(embedder.id))) {
+    warnings.push({ code: 'EMBEDDING_MODEL_MISMATCH', message: 'The query embedding model differs from the corpus model; searching full text only.', retryable: false,
+      suggested_action: 'Match the server model to the corpus, or deliberately switch with contextual reindex --all.' });
+  } else {
     try {
       vectors = (await embedder.embed(qs, 'query')).map((v) => toVector(v));
-    } catch {
+    } catch (err) {
       vectors = qs.map(() => null);
+      const auth = err instanceof EmbeddingError && err.failure === 'auth';
+      warnings.push({ code: auth ? 'EMBEDDING_AUTH_FAILED' : 'EMBEDDING_UNAVAILABLE',
+        message: auth ? 'Embedding authentication failed; searching full text only.' : 'Embedding request failed; searching full text only.',
+        retryable: err instanceof EmbeddingError && err.failure === 'transient',
+        suggested_action: auth ? 'Check the embedding provider credentials in the server environment.' : 'Run contextual doctor to check the provider and model; use lexical queries in the meantime.' });
     }
   }
 
@@ -112,11 +135,18 @@ export async function search(queries: string[], opts: SearchOptions = {}): Promi
 
   const candidates = rrf(lists).slice(0, Math.max(30, limit));
   let preferred: number[] = [];
-  try {
+  const rerankMissingKey = process.env.CONTEXTUAL_RERANK === 'true' && !(process.env.VOYAGE_API_KEY ?? process.env.CONTEXTUAL_VOYAGE_API_KEY);
+  if (rerankMissingKey) {
+    warnings.push({ code: 'RERANK_UNAVAILABLE', message: 'Reranking is enabled but no Voyage key is configured; using the original ranking.', retryable: false,
+      suggested_action: 'Configure the reranker credentials or set CONTEXTUAL_RERANK=false.' });
+  } else try {
     const order = await rerank(qs.join('\n'), candidates.map((c) => [c.item.sourceName, ...c.item.headingPath, c.item.content].join('\n')));
     preferred = order?.map((i) => candidates[i]!.item.chunkId) ?? [];
-  } catch { /* Reranking is optional: retain deterministic fusion on failure. */ }
-  return diversify(lists, qs.length, limit, 3, preferred);
+  } catch (err) {
+    warnings.push({ code: 'RERANK_UNAVAILABLE', message: 'Reranking failed; using the original retrieval ranking.', retryable: err instanceof EmbeddingError && err.failure === 'transient',
+      suggested_action: 'Retry later, or check the reranker configuration and credentials.' });
+  }
+  return { hits: diversify(lists, qs.length, limit, 3, preferred), retrieval_mode: vectors.some((v) => v !== null) ? 'hybrid' : 'full_text', warnings };
 
 }
 
@@ -260,7 +290,7 @@ export function parseScope(scope?: string): Scope {
   const [realm, ...rest] = parts;
   const kind = realm === 'skills' ? 'skill' : realm === 'docs' ? 'doc' : null;
   if (!kind || rest.length > 1) {
-    throw new Error(`invalid scope "${scope}": use "skills", "docs", "skills/{name}" or "docs/{collection}"`);
+    throw new InputError(`invalid scope "${scope}": use "skills", "docs", "skills/{name}" or "docs/{collection}"`);
   }
   return { kind, name: rest[0] ?? null };
 }

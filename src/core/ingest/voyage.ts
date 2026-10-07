@@ -7,6 +7,8 @@ export class EmbeddingError extends Error {
 export interface RequestOptions {
   sleep?: (ms: number) => Promise<unknown>;
   random?: () => number;
+  timeoutMs?: number;
+  maxAttempts?: number;
 }
 export function retryAfterMs(value: string | null, now = Date.now()): number | null {
   if (value === null) return null;
@@ -17,7 +19,7 @@ export function retryAfterMs(value: string | null, now = Date.now()): number | n
 }
 /** Shared bounded retry/timeout policy for Voyage embedding and rerank calls. */
 export async function voyageRequest(endpoint: string, payload: unknown, apiKey: string, opts: RequestOptions = {}): Promise<any> {
-  const attempts = envNumber('CONTEXTUAL_VOYAGE_MAX_ATTEMPTS');
+  const attempts = opts.maxAttempts ?? envNumber('CONTEXTUAL_VOYAGE_MAX_ATTEMPTS');
   const maxWait = envNumber('CONTEXTUAL_VOYAGE_RETRY_MAX_MS');
   const sleep = opts.sleep ?? ((ms: number) => Bun.sleep(ms));
   let wait = 0, last = 'unknown error';
@@ -26,7 +28,7 @@ export async function voyageRequest(endpoint: string, payload: unknown, apiKey: 
     try {
       const response = await fetch(`https://api.voyageai.com/v1/${endpoint}`, {
         method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify(payload), signal: AbortSignal.timeout(envNumber('CONTEXTUAL_VOYAGE_TIMEOUT_MS')),
+        body: JSON.stringify(payload), signal: AbortSignal.timeout(opts.timeoutMs ?? envNumber('CONTEXTUAL_VOYAGE_TIMEOUT_MS')),
       });
       if (response.ok) return await response.json();
       last = `voyage ${response.status}: ${(await response.text()).slice(0, 1000)}`;

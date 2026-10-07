@@ -30,15 +30,19 @@ Usage:
   contextual remove <kind> <name> Remove a source (kind: skill | doc)
   contextual migrate              Apply database migrations
   contextual serve                Run the MCP server (stdio by default)
+  contextual doctor [--json]       Diagnose runtime, database, storage and embeddings
+  contextual init                 Generate .mcp.json and run connectivity checks
 
 Options:
   --collection <name>   Collection for ingested documents (default: "default")
   --lenient             Warn and ignore unknown skill frontmatter keys
   --force               Re-ingest even when the content hash is unchanged
+                        init: replace only an existing contextual server entry
   --allow-reserved      Permit "claude"/"anthropic" in a skill name (see README)
   --all                 reindex: re-embed every chunk, not only unembedded ones
                         (also required after changing embedding provider/model)
   --json                Machine-readable output
+  --output <file>       init: destination MCP config (default: .mcp.json)
   --transport <name>    serve: stdio (default) or http (Streamable HTTP at /mcp)
   --host <address>      HTTP bind address (default: 127.0.0.1)
   --port <number>       HTTP port (default: 3000)

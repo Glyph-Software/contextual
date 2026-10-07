@@ -147,7 +147,9 @@ describe('every tool respects its output cap', () => {
     const r = await rpc([{ id: 1, method: 'tools/call', params: { name: 'cx_read', arguments: { uri: 'ctx://skills/cap-test/SKILL.md' } } }]);
     const body = textOf(r.messages.get(1));
     expect(body).toContain('[truncated:');
-    expect(body).toMatch(/cx_read\(uri, offset=\d+\)/);
+    const cursor = r.messages.get(1).result.structuredContent.next_cursor;
+    expect(cursor).toBeString();
+    expect(body).toContain(cursor);
   });
 
   test('the offset pointer actually continues the file', async () => {
@@ -167,6 +169,20 @@ describe('every tool respects its output cap', () => {
 });
 
 describe('tool results carry citations', () => {
+  test.each(['2025-06-18', '2026-07-28'])('cursor, discovery and error metadata survive the %s wire format', async (protocolVersion) => {
+    const r = await rpc([
+      { id: 1, method: 'tools/list' },
+      { id: 2, method: 'tools/call', params: { name: 'cx_search', arguments: { queries: ['large files'], target: 'skills' } } },
+      { id: 3, method: 'tools/call', params: { name: 'cx_read', arguments: { uri: 'ctx://skills/cap-test/SKILL.md' } } },
+      { id: 4, method: 'tools/call', params: { name: 'cx_read', arguments: { uri: 'ctx://skills/cap-test/SKILL.md', cursor: 'invalid' } } },
+    ], { protocolVersion });
+    expect(r.messages.get(1).result.tools.every((t: any) => t.outputSchema.properties.next_cursor)).toBe(true);
+    expect(r.messages.get(2).result.structuredContent).toMatchObject({ retrieval_mode: 'skill_metadata', returned: 1 });
+    expect(r.messages.get(3).result.structuredContent.next_cursor).toBeString();
+    expect(r.messages.get(4).result.structuredContent.error.code).toBe('INVALID_CURSOR');
+    expect(r.messages.get(4).result.isError).toBe(true);
+  });
+
   test('search hits come back as resource_links to chunk URIs', async () => {
     const r = await rpc([{ id: 1, method: 'tools/call', params: { name: 'cx_search', arguments: { queries: ['marker token HAYSTACK'] } } }]);
     const links = linksOf(r.messages.get(1));

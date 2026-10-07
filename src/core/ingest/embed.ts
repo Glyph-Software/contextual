@@ -103,6 +103,7 @@ export class OllamaEmbedder implements Embedder {
   constructor(
     private model = process.env.CONTEXTUAL_EMBED_MODEL ?? 'qwen3-embedding:0.6b',
     baseUrl = process.env.CONTEXTUAL_OLLAMA_URL ?? 'http://127.0.0.1:11434',
+    private timeoutMs?: number,
   ) {
     if (!model.trim()) throw new Error('CONTEXTUAL_EMBED_MODEL must not be empty');
     let url: URL;
@@ -129,7 +130,7 @@ export class OllamaEmbedder implements Embedder {
         response = await fetch(this.endpoint, {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ model: this.model, input: batch.map((i) => input[i]!), dimensions: this.dims, truncate: true }),
-          signal: AbortSignal.timeout(envNumber('CONTEXTUAL_OLLAMA_TIMEOUT_MS')),
+          signal: AbortSignal.timeout(this.timeoutMs ?? envNumber('CONTEXTUAL_OLLAMA_TIMEOUT_MS')),
         });
         if (response.ok) body = await response.json();
         else await response.body?.cancel();

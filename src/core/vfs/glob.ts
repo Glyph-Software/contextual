@@ -14,6 +14,7 @@
  */
 import { db } from '../db';
 import { normalizeVfsPath, escapeLike } from './uri';
+import { InputError } from '../errors';
 
 export interface GlobHit {
   path: string;
@@ -45,16 +46,16 @@ export function globToRegExpSource(pattern: string): string {
     } else if (c === '?') out += '[^/]';
     else if (c === '{') {
       const end = pattern.indexOf('}', i);
-      if (end === -1 || pattern.slice(i + 1, end).includes('{')) throw new Error('invalid or nested brace glob');
+      if (end === -1 || pattern.slice(i + 1, end).includes('{')) throw new InputError('invalid or nested brace glob');
       out += `(?:${pattern.slice(i + 1, end).split(',').map((part) => globToRegExpSource(part).slice(1, -1)).join('|')})`;
       i = end;
     } else if (c === '[') {
       const end = pattern.indexOf(']', i + 1);
-      if (end === -1) throw new Error('unclosed character class in glob');
+      if (end === -1) throw new InputError('unclosed character class in glob');
       let chars = pattern.slice(i + 1, end);
       const negate = chars.startsWith('!') || chars.startsWith('^');
       if (negate) chars = chars.slice(1);
-      if (!chars || /[\\/[]/.test(chars)) throw new Error('invalid glob character class');
+      if (!chars || /[\\/[]/.test(chars)) throw new InputError('invalid glob character class');
       out += negate ? `[^/${chars}]` : `[${chars}]`;
       i = end;
     } else out += escapeRe(c);
@@ -115,7 +116,7 @@ export function decomposeGlob(pattern: string): GlobParts {
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const isLiteral = (seg: string | undefined) => seg !== undefined && !/[*?{[]/.test(seg);
 
-export async function glob(pattern: string, limit = 200): Promise<GlobHit[]> {
+export async function glob(pattern: string, limit = 200, offset = 0): Promise<GlobHit[]> {
   const { kind, root, prefix, regexSource } = decomposeGlob(pattern);
 
   const rows = (await db()`
@@ -128,8 +129,8 @@ export async function glob(pattern: string, limit = 200): Promise<GlobHit[]> {
       AND (${root === null} OR s.name = ${root} OR coalesce(s.collection,'default') = ${root})
       AND (${prefix === ''} OR n.path LIKE ${`${escapeLike(prefix)}%`})
     AND ('/' || CASE WHEN s.kind='skill' THEN 'skills/' || s.name ELSE 'docs/' || coalesce(s.collection,'default') END || '/' || n.path) ~ ${regexSource}
-    ORDER BY n.path COLLATE "C"
-    LIMIT ${limit}
+    ORDER BY path COLLATE "C", n.uri COLLATE "C"
+    LIMIT ${limit} OFFSET ${offset}
   `) as unknown as GlobHit[];
 
   return rows;

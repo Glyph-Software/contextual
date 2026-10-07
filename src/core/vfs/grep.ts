@@ -27,6 +27,7 @@ import { envNumber } from '../config';
 import { withStatementTimeout, isTimeout } from '../db';
 import { escapeLike } from './uri';
 import { decomposeGlob } from './glob';
+import { InputError } from '../errors';
 
 export interface GrepMatch {
   uri: string;
@@ -39,12 +40,11 @@ export interface GrepOptions {
   pathGlob?: string;
   ignoreCase?: boolean;
   maxMatches?: number;
+  offset?: number;
   /** Overrides the statement timeout, in milliseconds. */
   timeoutMs?: number;
 }
 
-/** Candidate files per query. Past this, the caller is told to narrow. */
-export const MAX_FILES = 200;
 const MAX_LINE_CHARS = 300;
 export const DEFAULT_TIMEOUT_MS = envNumber('CONTEXTUAL_GREP_TIMEOUT_MS');
 
@@ -52,7 +52,7 @@ export class GrepTooExpensiveError extends Error {}
 
 export async function grep(pattern: string, opts: GrepOptions = {}): Promise<GrepMatch[]> {
   const { ignoreCase = true, maxMatches = 60 } = opts;
-  if (!pattern) throw new Error('invalid regular expression: empty pattern');
+  if (!pattern) throw new InputError('invalid regular expression: empty pattern');
 
   const re = newlineSensitive(pattern);
   // The path filter is a VFS glob (`/skills/pdf/**`), but `nodes.path` holds a
@@ -88,14 +88,13 @@ export async function grep(pattern: string, opts: GrepOptions = {}): Promise<Gre
           -- to the full VFS path that the agent actually sees.
           SELECT * FROM candidates
           WHERE ${parts === null} OR path ~ ${parts?.regexSource ?? ''}
-          ORDER BY path LIMIT ${MAX_FILES}
         )
         SELECT c.uri, c.path, l.ord::int AS line, left(btrim(l.line), ${MAX_LINE_CHARS}) AS text
         FROM scoped c
         CROSS JOIN LATERAL regexp_split_to_table(c.content, E'\\n') WITH ORDINALITY AS l(line, ord)
         WHERE ${lineMatch}
-        ORDER BY c.path, l.ord
-        LIMIT ${maxMatches}
+        ORDER BY c.path COLLATE "C", c.uri COLLATE "C", l.ord
+        LIMIT ${maxMatches} OFFSET ${opts.offset ?? 0}
       `) as unknown as GrepMatch[];
     });
   } catch (err) {
@@ -107,7 +106,7 @@ export async function grep(pattern: string, opts: GrepOptions = {}): Promise<Gre
     }
     const message = (err as Error).message ?? String(err);
     if (/regular expression/i.test(message)) {
-      throw new Error(
+      throw new InputError(
         `invalid regular expression: ${message.replace(/^.*?invalid regular expression:\s*/i, '')} ` +
           `(patterns are Postgres regular expressions; named groups are not supported)`,
       );
